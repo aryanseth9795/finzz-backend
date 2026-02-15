@@ -5,14 +5,14 @@ import { JWT_SECRET,adminSecretKey } from "../config/envVariables.js";
 
 // Users Authentication ----->
 const isAuthenticated = (req:Request & { user?: { id: string } }, res:Response, next:NextFunction) => {
-  const token = req.cookies["token"];
+  const token = req.cookies["token"] || req.headers["authorization"]?.replace("Bearer ", "");
   if (!token)
     return next(new ErrorHandler("Please login to access this route", 401));
-  const user = jwt.verify(token,JWT_SECRET ) as { _id: string } | null;
+  const user = jwt.verify(token,JWT_SECRET ) as { id: string } | null;
 
   if (!user) return next(new ErrorHandler("Please login ! Token Expired", 401));
-
-  req.user!.id = user._id;
+console.log(user);
+  req.user = {id:user.id};
   next();
 };
 export default isAuthenticated;

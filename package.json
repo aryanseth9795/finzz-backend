@@ -20,25 +20,32 @@
   "main": "server.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-     "build": "tsc",
+    "build": "tsc",
     "start": "node dist/server.js",
     "dev": "concurrently \"tsc -w\" \"  nodemon ./dist/server.js\" "
   },
   "dependencies": {
+    "@types/cors": "^2.8.19",
     "bcrypt": "^6.0.0",
     "body-parser": "^2.2.0",
+    "cloudinary": "^2.9.0",
     "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
     "dotenv": "^17.2.3",
+    "expo-server-sdk": "^5.0.0",
     "express": "^5.1.0",
     "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.20.0"
+    "mongoose": "^8.20.0",
+    "multer": "^2.0.2",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/bcrypt": "^6.0.0",
     "@types/cookie-parser": "^1.4.10",
     "@types/express": "^5.0.5",
     "@types/jsonwebtoken": "^9.0.10",
-    "nodemon": "^3.1.11",
-    "concurrently": "^9.1.0"
+    "@types/multer": "^2.0.0",
+    "concurrently": "^9.1.0",
+    "nodemon": "^3.1.11"
   }
 }
