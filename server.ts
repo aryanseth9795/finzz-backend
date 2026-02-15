@@ -1,7 +1,7 @@
 import express from "express";
 import cookieParser from "cookie-parser";
 import dotenv from "dotenv";
-
+import axios from "axios";
 // Routes
 import userRoutes from "./src/routes/userRoutes.js";
 import txRoutes from "./src/routes/txnRoutes.js";
@@ -43,6 +43,14 @@ app.use("/api/v1/stats", statsRoutes); // Transaction statistics
 // Error handling middleware (must be last)
 app.use(errorMiddleware);
 
+
+function ping(){
+  axios.get(process.env.API_URL  + "/ping").then((res) => {
+    console.log(res.data);
+  });
+}
+
+setInterval(ping, 12000);
 app.listen(3000, () => {
   console.log("Server is running on port 3000");
 });
