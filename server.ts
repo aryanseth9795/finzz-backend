@@ -43,9 +43,8 @@ app.use("/api/v1/stats", statsRoutes); // Transaction statistics
 // Error handling middleware (must be last)
 app.use(errorMiddleware);
 
-
-function ping(){
-  axios.get(process.env.API_URL  + "/ping").then((res) => {
+function ping() {
+  axios.get(process.env.API_URL + "/health").then((res) => {
     console.log(res.data);
   });
 }
