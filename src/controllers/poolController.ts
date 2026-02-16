@@ -71,7 +71,7 @@ export const getPoolById = TryCatch(
     }
 
     // Check membership
-    const isMember = pool.members.some(
+    const isMember = (pool as any).members.some(
       (member: any) => member._id.toString() === userId,
     );
 
@@ -182,7 +182,7 @@ export const addMember = TryCatch(
 
     // Check if already a member
     const alreadyMember = pool.members.some(
-      (member) => member.toString() === newMemberId,
+      (member: any) => member.toString() === newMemberId,
     );
 
     if (alreadyMember) {
@@ -198,7 +198,7 @@ export const addMember = TryCatch(
     await sendPushNotification(
       newMemberId,
       "Pool Invite",
-      `${adminUser?.name} added you to ${pool.name}`,
+      `${(adminUser as any)?.name} added you to ${(pool as any).name}`,
       {
         type: "pool_member_added",
         senderId: adminId,
@@ -244,7 +244,7 @@ export const removeMember = TryCatch(
 
     // Check if member exists in pool
     const isMember = pool.members.some(
-      (member) => member.toString() === memberToRemove,
+      (member: any) => member.toString() === memberToRemove,
     );
 
     if (!isMember) {
@@ -253,7 +253,7 @@ export const removeMember = TryCatch(
 
     // Remove member
     pool.members = pool.members.filter(
-      (member) => member.toString() !== memberToRemove,
+      (member: any) => member.toString() !== memberToRemove,
     );
     await pool.save();
 
@@ -262,7 +262,7 @@ export const removeMember = TryCatch(
     await sendPushNotification(
       memberToRemove,
       "Pool Update",
-      `${adminUser?.name} removed you from ${pool.name}`,
+      `${(adminUser as any)?.name} removed you from ${(pool as any).name}`,
       {
         type: "pool_member_removed",
         senderId: adminId,
@@ -292,7 +292,7 @@ export const leavePool = TryCatch(
 
     // Check if member
     const isMember = pool.members.some(
-      (member) => member.toString() === userId,
+      (member: any) => member.toString() === userId,
     );
 
     if (!isMember) {
@@ -303,7 +303,7 @@ export const leavePool = TryCatch(
     if (pool.admin.toString() === userId) {
       // Transfer admin to next member or delete if last member
       const otherMembers = pool.members.filter(
-        (member) => member.toString() !== userId,
+        (member: any) => member.toString() !== userId,
       );
 
       if (otherMembers.length === 0) {
@@ -330,7 +330,7 @@ export const leavePool = TryCatch(
 
     // Regular member leaving
     pool.members = pool.members.filter(
-      (member) => member.toString() !== userId,
+      (member: any) => member.toString() !== userId,
     );
     await pool.save();
 
@@ -427,7 +427,7 @@ export const addPoolTx = TryCatch(
 
     // Check membership
     const isMember = pool.members.some(
-      (member) => member.toString() === userId,
+      (member: any) => member.toString() === userId,
     );
 
     if (!isMember) {
@@ -466,15 +466,15 @@ export const addPoolTx = TryCatch(
 
     // Send bulk push notifications to all other members
     const otherMembers = pool.members.filter(
-      (member) => member.toString() !== userId,
+      (member: any) => member.toString() !== userId,
     );
 
     const senderName = await User.findById(userId).select("name").lean();
 
-    const notifications = otherMembers.map((memberId) => ({
+    const notifications = otherMembers.map((memberId: any) => ({
       userId: memberId.toString(),
       title: `Pool: ${pool.name}`,
-      body: `${senderName?.name} added ₹${amount} (${type})`,
+      body: `${(senderName as any)?.name} added ₹${amount} (${type})`,
       data: {
         type: "pool_tx_added",
         senderId: userId,
@@ -516,7 +516,7 @@ export const getPoolTxns = TryCatch(
     }
 
     const isMember = pool.members.some(
-      (member) => member.toString() === userId,
+      (member: any) => member.toString() === userId,
     );
 
     if (!isMember) {
@@ -610,7 +610,7 @@ export const editPoolTx = TryCatch(
       .sort({ date: -1 })
       .lean();
 
-    if (latestTx && latestTx._id.toString() === txnId) {
+    if (latestTx && (latestTx as any)._id.toString() === txnId) {
       await Pool.findByIdAndUpdate(poolTx.poolId, {
         lastTransaction: {
           amount: poolTx.amount,
@@ -674,10 +674,10 @@ export const deletePoolTx = TryCatch(
     if (latestTx) {
       await Pool.findByIdAndUpdate(poolId, {
         lastTransaction: {
-          amount: latestTx.amount,
-          date: latestTx.date,
-          remark: latestTx.remarks || "",
-          addedBy: latestTx.addedBy,
+          amount: (latestTx as any).amount,
+          date: (latestTx as any).date,
+          remark: (latestTx as any).remarks || "",
+          addedBy: (latestTx as any).addedBy,
         },
       });
     } else {
@@ -724,7 +724,7 @@ export const verifyPoolTx = TryCatch(
     }
 
     const isMember = pool.members.some(
-      (member) => member.toString() === userId,
+      (member: any) => member.toString() === userId,
     );
 
     if (!isMember) {
@@ -744,7 +744,7 @@ export const verifyPoolTx = TryCatch(
     await sendPushNotification(
       poolTx.addedBy.toString(),
       `Pool: ${pool.name}`,
-      `${verifierName?.name} verified your ₹${poolTx.amount} entry`,
+      `${(verifierName as any)?.name} verified your ₹${poolTx.amount} entry`,
       {
         type: "pool_tx_verified",
         senderId: userId,
@@ -773,7 +773,7 @@ export const getPoolStats = TryCatch(
     }
 
     // Check membership
-    const isMember = pool.members.some(
+    const isMember = (pool as any).members.some(
       (member: any) => member._id.toString() === userId,
     );
 
@@ -795,7 +795,7 @@ export const getPoolStats = TryCatch(
     const netBalance = totalCredited - totalDebited;
 
     // Calculate duration
-    const createdAt = new Date(pool.createdAt);
+    const createdAt = new Date((pool as any).createdAt);
     const now = new Date();
     const durationDays = Math.floor(
       (now.getTime() - createdAt.getTime()) / (1000 * 60 * 60 * 24),
@@ -804,7 +804,7 @@ export const getPoolStats = TryCatch(
     // Per-member breakdown
     const memberBreakdown: any[] = [];
 
-    for (const member of pool.members as any[]) {
+    for (const member of (pool as any).members as any[]) {
       const memberTxns = transactions.filter(
         (tx) => tx.addedBy.toString() === member._id.toString(),
       );

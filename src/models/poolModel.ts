@@ -39,7 +39,7 @@ const poolSchema = new Schema<IPool>(
       maxlength: 1000,
     },
     admin: {
-      type: Types.ObjectId,
+      type: Schema.Types.ObjectId,
       ref: "User",
       required: true,
       index: true,
