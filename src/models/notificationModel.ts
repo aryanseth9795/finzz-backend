@@ -3,7 +3,15 @@ import mongoose, { Document, Schema } from "mongoose";
 export interface INotification extends Document {
   recipient: mongoose.Types.ObjectId;
   sender: mongoose.Types.ObjectId;
-  type: "friend_request" | "friend_accepted" | "txn_added" | "txn_verified";
+  type:
+    | "friend_request"
+    | "friend_accepted"
+    | "txn_added"
+    | "txn_verified"
+    | "pool_tx_added"
+    | "pool_tx_verified"
+    | "pool_member_added"
+    | "pool_member_removed";
   data?: Record<string, any>;
   read: boolean;
   createdAt: Date;
@@ -25,7 +33,16 @@ const notificationSchema = new Schema<INotification>(
     },
     type: {
       type: String,
-      enum: ["friend_request", "friend_accepted", "txn_added", "txn_verified"],
+      enum: [
+        "friend_request",
+        "friend_accepted",
+        "txn_added",
+        "txn_verified",
+        "pool_tx_added",
+        "pool_tx_verified",
+        "pool_member_added",
+        "pool_member_removed",
+      ],
       required: true,
     },
     data: {

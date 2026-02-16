@@ -8,6 +8,7 @@ import txRoutes from "./src/routes/txnRoutes.js";
 import friendRoutes from "./src/routes/friendRoutes.js";
 import chatRoutes from "./src/routes/chatRoutes.js";
 import statsRoutes from "./src/routes/statsRoutes.js";
+import poolRoutes from "./src/routes/poolRoutes.js";
 
 // Middleware
 import errorMiddleware from "./src/middlewares/error.js";
@@ -39,6 +40,7 @@ app.use("/api/v1/txns", txRoutes);
 app.use("/api/v1/friends", friendRoutes); // Friend system with contact sync
 app.use("/api/v1/chats", chatRoutes); // WhatsApp-style chat list
 app.use("/api/v1/stats", statsRoutes); // Transaction statistics
+app.use("/api/v1/pools", poolRoutes); // Pool management
 
 // Error handling middleware (must be last)
 app.use(errorMiddleware);

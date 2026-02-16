@@ -93,3 +93,40 @@ export const validate = (schema: z.ZodSchema) => {
     }
   };
 };
+
+// ========================
+// Pool Validation Schemas
+// ========================
+
+export const createPoolSchema = z.object({
+  body: z.object({
+    name: z.string().min(1, "Pool name is required").max(100).trim(),
+    description: z.string().max(500).optional(),
+    rules: z.string().max(1000).optional(),
+  }),
+});
+
+export const updatePoolSchema = z.object({
+  body: z.object({
+    name: z.string().min(1).max(100).trim().optional(),
+    description: z.string().max(500).optional(),
+    rules: z.string().max(1000).optional(),
+    image: z.string().url("Invalid image URL").optional(),
+  }),
+});
+
+export const addPoolTxSchema = z.object({
+  body: z.object({
+    poolId: z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid poolId"),
+    amount: z.number().positive("Amount must be > 0"),
+    type: z.enum(["credit", "debit"]),
+    date: z.string().datetime("ISO 8601 required"),
+    remarks: z.string().optional(),
+  }),
+});
+
+export const poolMemberSchema = z.object({
+  body: z.object({
+    userId: z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid userId"),
+  }),
+});
