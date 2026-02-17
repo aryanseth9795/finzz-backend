@@ -1,7 +1,9 @@
 import { NextFunction, Request, Response } from "express";
+import mongoose from "mongoose";
 import TryCatch from "../utils/TryCatch.js";
 import { Expense } from "../models/expenseModel.js";
 import { ExpenseLedger } from "../models/expenseLedgerModel.js";
+import { User } from "../models/userModel.js";
 import ErrorHandler from "../middlewares/Errorhandler.js";
 
 // ==========================================
@@ -222,6 +224,9 @@ export const getStats = TryCatch(
     const userId = req.user.id;
     const { period = "monthly" } = req.query;
 
+    // Convert userId string to ObjectId for aggregation
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
     let stats: any = {};
 
     if (period === "daily") {
@@ -232,7 +237,7 @@ export const getStats = TryCatch(
       const dailyStats = await Expense.aggregate([
         {
           $match: {
-            userId: userId,
+            userId: userObjectId,
             date: { $gte: thirtyDaysAgo },
           },
         },
@@ -258,7 +263,7 @@ export const getStats = TryCatch(
     if (period === "monthly" || !period) {
       // Group by month
       const monthlyStats = await Expense.aggregate([
-        { $match: { userId: userId } },
+        { $match: { userId: userObjectId } },
         {
           $group: {
             _id: {
@@ -282,7 +287,7 @@ export const getStats = TryCatch(
     if (period === "yearly") {
       // Group by year
       const yearlyStats = await Expense.aggregate([
-        { $match: { userId: userId } },
+        { $match: { userId: userObjectId } },
         {
           $group: {
             _id: { $year: "$date" },
@@ -302,7 +307,7 @@ export const getStats = TryCatch(
 
     // Grand total
     const grandTotal = await Expense.aggregate([
-      { $match: { userId: userId } },
+      { $match: { userId: userObjectId } },
       { $group: { _id: null, total: { $sum: "$amount" } } },
     ]);
 
@@ -401,6 +406,21 @@ export const exportPDF = TryCatch(
     // Get all expenses for this ledger
     const expenses = await Expense.find({ ledgerId }).sort({ date: -1 }).lean();
 
+    // Get user details from DB
+    const userDoc = await User.findById(userId)
+      .select("name mobile email")
+      .lean();
+
+    if (!userDoc) {
+      return next(new ErrorHandler("User not found", 404));
+    }
+
+    const user = {
+      name: (userDoc as any).name || "User",
+      mobile: (userDoc as any).mobile || "",
+      email: (userDoc as any).email || "",
+    };
+
     // Build HTML string
     const html = `
       <!DOCTYPE html>
@@ -409,46 +429,179 @@ export const exportPDF = TryCatch(
         <meta charset="utf-8">
         <title>Expense Report - ${ledger.year}-${String(ledger.month).padStart(2, "0")}</title>
         <style>
-          body { font-family: Arial, sans-serif; padding: 20px; }
-          h1 { color: #333; }
-          table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-          th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-          th { background-color: #4F46E5; color: white; }
-          .total { font-weight: bold; background-color: #f0f0f0; }
+          * { margin: 0; padding: 0; box-sizing: border-box; }
+          body { 
+            font-family: 'Segoe UI', Arial, sans-serif; 
+            padding: 40px; 
+            background: #f9fafb;
+          }
+          .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            padding: 40px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+          }
+          .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 3px solid #4F46E5;
+          }
+          .logo {
+            font-size: 32px;
+            font-weight: 900;
+            color: #4F46E5;
+            font-style: italic;
+            letter-spacing: -1px;
+          }
+          .user-details {
+            text-align: right;
+            color: #6B7280;
+            line-height: 1.6;
+          }
+          .user-details strong {
+            color: #1F2937;
+          }
+          .report-title {
+            font-size: 24px;
+            font-weight: 700;
+            color: #1F2937;
+            margin-bottom: 20px;
+          }
+          .report-info {
+            display: flex;
+            gap: 30px;
+            margin-bottom: 30px;
+            padding: 15px;
+            background: #F3F4F6;
+            border-radius: 6px;
+          }
+          .info-item {
+            color: #6B7280;
+          }
+          .info-item strong {
+            color: #1F2937;
+            display: block;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
+          }
+          table { 
+            width: 100%; 
+            border-collapse: collapse; 
+            margin-top: 20px;
+          }
+          th, td { 
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #E5E7EB;
+          }
+          th { 
+            background-color: #4F46E5;
+            color: white;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+          }
+          tr:hover {
+            background-color: #F9FAFB;
+          }
+          .amount-cell {
+            text-align: right;
+            font-weight: 600;
+            color: #EF4444;
+          }
+          .total-row {
+            font-weight: bold;
+            background-color: #F3F4F6;
+            border-top: 2px solid #4F46E5;
+          }
+          .total-row td {
+            padding: 16px 12px;
+            font-size: 16px;
+            color: #1F2937;
+          }
+          .total-row .amount-cell {
+            color: #EF4444;
+            font-size: 18px;
+          }
+          .footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #E5E7EB;
+            text-align: center;
+            color: #9CA3AF;
+            font-size: 12px;
+          }
         </style>
       </head>
       <body>
-        <h1>Expense Report</h1>
-        <p><strong>Period:</strong> ${ledger.year}-${String(ledger.month).padStart(2, "0")}</p>
-        <p><strong>Status:</strong> ${ledger.status}</p>
-        <table>
-          <thead>
-            <tr>
-              <th>Date</th>
-              <th>Amount (₹)</th>
-              <th>Category</th>
-              <th>Remarks</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${expenses
-              .map(
-                (exp) => `
+        <div class="container">
+          <div class="header">
+            <div class="logo">Finzz</div>
+            <div class="user-details">
+              <div><strong>${user.name || "User"}</strong></div>
+              ${user.mobile ? `<div>${user.mobile}</div>` : ""}
+              ${user.email ? `<div>${user.email}</div>` : ""}
+            </div>
+          </div>
+          
+          <div class="report-title">Expense Report</div>
+          
+          <div class="report-info">
+            <div class="info-item">
+              <strong>Period</strong>
+              <div>${ledger.year}-${String(ledger.month).padStart(2, "0")}</div>
+            </div>
+            <div class="info-item">
+              <strong>Status</strong>
+              <div style="text-transform: capitalize;">${ledger.status}</div>
+            </div>
+            <div class="info-item">
+              <strong>Generated</strong>
+              <div>${new Date().toLocaleDateString()}</div>
+            </div>
+          </div>
+          
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 15%;">Date</th>
+                <th style="width: 40%;">Remarks</th>
+                <th style="width: 20%;">Category</th>
+                <th style="width: 25%; text-align: right;">Amount (₹)</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${expenses
+                .map(
+                  (exp) => `
               <tr>
                 <td>${new Date(exp.date).toLocaleDateString()}</td>
-                <td>₹${exp.amount.toFixed(2)}</td>
-                <td>${exp.category || "-"}</td>
                 <td>${exp.remarks || "-"}</td>
+                <td>${exp.category || "-"}</td>
+                <td class="amount-cell">₹${exp.amount.toFixed(2)}</td>
               </tr>
             `,
-              )
-              .join("")}
-            <tr class="total">
-              <td colspan="3">Total</td>
-              <td>₹${ledger.totalExpenses.toFixed(2)}</td>
-            </tr>
-          </tbody>
-        </table>
+                )
+                .join("")}
+              <tr class="total-row">
+                <td colspan="3" style="text-align: right; padding-right: 20px;">TOTAL</td>
+                <td class="amount-cell">₹${ledger.totalExpenses.toFixed(2)}</td>
+              </tr>
+            </tbody>
+          </table>
+          
+          <div class="footer">
+            Generated by Finzz &copy; ${new Date().getFullYear()}
+          </div>
+        </div>
       </body>
       </html>
     `;
