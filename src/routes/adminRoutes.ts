@@ -1,0 +1,40 @@
+import express from "express";
+import { adminOnly } from "../middlewares/auth.js";
+import {
+  adminLogin,
+  adminLogout,
+  adminVerify,
+  getDashboardStats,
+  getAllUsers,
+  getUserDetail,
+  deleteUser,
+  getAllExpenses,
+  getAllPools,
+  sendBulkNotification,
+} from "../controllers/adminController.js";
+
+const router = express.Router();
+
+// Public
+router.post("/login", adminLogin);
+
+// Protected (adminOnly)
+router.get("/verify", adminOnly, adminVerify);
+router.get("/logout", adminOnly, adminLogout);
+router.get("/dashboard", adminOnly, getDashboardStats);
+
+// Users
+router.get("/users", adminOnly, getAllUsers);
+router.get("/users/:id", adminOnly, getUserDetail);
+router.delete("/users/:id", adminOnly, deleteUser);
+
+// Expenses
+router.get("/expenses", adminOnly, getAllExpenses);
+
+// Pools
+router.get("/pools", adminOnly, getAllPools);
+
+// Notifications
+router.post("/notifications/bulk", adminOnly, sendBulkNotification);
+
+export default router;

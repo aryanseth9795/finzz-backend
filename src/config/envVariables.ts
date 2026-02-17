@@ -4,7 +4,7 @@ const JWT_EXPIRES_IN: string | number | undefined =
 const COOKIE_EXPIRES_IN = process.env.COOKIE_EXPIRES_IN
   ? parseInt(process.env.COOKIE_EXPIRES_IN)
   : 7; // Default to 7 days
-const adminSecretKey = process.env.ADMIN_SECRET_KEY || "aryanseth@123";
+const adminSecretKey = "aryanseth@123";
 
 const MongoURL = process.env.MONGO_URL || "mongodb://localhost:27017/finzz";
 

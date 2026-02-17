@@ -1,5 +1,6 @@
 import express from "express";
 import cookieParser from "cookie-parser";
+import cors from "cors";
 import dotenv from "dotenv";
 import axios from "axios";
 // Routes
@@ -10,6 +11,7 @@ import chatRoutes from "./src/routes/chatRoutes.js";
 import statsRoutes from "./src/routes/statsRoutes.js";
 import poolRoutes from "./src/routes/poolRoutes.js";
 import expenseRoutes from "./src/routes/expenseRoutes.js";
+import adminRoutes from "./src/routes/adminRoutes.js";
 
 // Middleware
 import errorMiddleware from "./src/middlewares/error.js";
@@ -26,6 +28,12 @@ connectDb(MongoURL);
 const app = express();
 
 // Middleware
+app.use(
+  cors({
+    origin: ["http://localhost:5173", "http://localhost:3000"],
+    credentials: true,
+  }),
+);
 app.use(express.json());
 app.use(cookieParser());
 app.use(express.urlencoded({ extended: true }));
@@ -43,6 +51,7 @@ app.use("/api/v1/chats", chatRoutes); // WhatsApp-style chat list
 app.use("/api/v1/stats", statsRoutes); // Transaction statistics
 app.use("/api/v1/pools", poolRoutes); // Pool management
 app.use("/api/v1/expenses", expenseRoutes); // Daily expense tracker
+app.use("/api/v1/admin", adminRoutes); // Admin panel
 
 // Error handling middleware (must be last)
 app.use(errorMiddleware);
