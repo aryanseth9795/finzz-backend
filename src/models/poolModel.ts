@@ -42,7 +42,6 @@ const poolSchema = new Schema<IPool>(
       type: Schema.Types.ObjectId,
       ref: "User",
       required: true,
-      index: true,
     },
     members: [
       {
