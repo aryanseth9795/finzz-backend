@@ -321,6 +321,148 @@ export const getStats = TryCatch(
 );
 
 // ==========================================
+// Get Advanced Stats (Charts & Analytics)
+// ==========================================
+export const getAdvancedStats = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const userId = req.user.id;
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    // Parse requested month/year (defaults to current month)
+    const now = new Date();
+    const year = parseInt(
+      (req.query.year as string) || String(now.getFullYear()),
+    );
+    const month = parseInt(
+      (req.query.month as string) || String(now.getMonth() + 1),
+    );
+
+    // ── 1. Monthly Trend (last 12 months including requested month) ──
+    const twelveMonthsAgo = new Date(year, month - 13, 1); // 12 months before requested
+    const monthlyTrend = await Expense.aggregate([
+      {
+        $match: {
+          userId: userObjectId,
+          date: { $gte: twelveMonthsAgo, $lt: new Date(year, month, 1) },
+        },
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: "$date" },
+            month: { $month: "$date" },
+          },
+          total: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { "_id.year": 1, "_id.month": 1 } },
+    ]);
+
+    // ── 2. Daily Breakdown for selected month ──
+    const startOfMonth = new Date(year, month - 1, 1);
+    const endOfMonth = new Date(year, month, 1);
+
+    const dailyBreakdown = await Expense.aggregate([
+      {
+        $match: {
+          userId: userObjectId,
+          date: { $gte: startOfMonth, $lt: endOfMonth },
+        },
+      },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%Y-%m-%d", date: "$date" } },
+          total: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]);
+
+    // ── 3. Remarks/Category Breakdown for selected month ──
+    const allMonthExpenses = await Expense.find({
+      userId: userObjectId,
+      date: { $gte: startOfMonth, $lt: endOfMonth },
+    }).lean();
+
+    const categoryMap: Record<string, { total: number; count: number }> = {};
+    let monthTotal = 0;
+
+    for (const exp of allMonthExpenses) {
+      monthTotal += exp.amount;
+      // Extract category label: use remarks prefix (#Tag) or category field or "Other"
+      let label = "Other";
+      if (exp.remarks) {
+        const match = exp.remarks.match(/^#\s*(.+)/);
+        if (match) {
+          label = match[1].trim();
+        }
+      } else if (exp.category) {
+        label = exp.category;
+      }
+      if (!categoryMap[label]) categoryMap[label] = { total: 0, count: 0 };
+      categoryMap[label].total += exp.amount;
+      categoryMap[label].count += 1;
+    }
+
+    const categoryBreakdown = Object.entries(categoryMap)
+      .map(([name, { total, count }]) => ({
+        name,
+        total: Math.round(total * 100) / 100,
+        count,
+        percentage:
+          monthTotal > 0 ? Math.round((total / monthTotal) * 100 * 10) / 10 : 0,
+      }))
+      .sort((a, b) => b.total - a.total);
+
+    // ── 4. Top 5 Expenses for selected month ──
+    const top5 = [...allMonthExpenses]
+      .sort((a, b) => b.amount - a.amount)
+      .slice(0, 5)
+      .map((e) => ({
+        _id: e._id,
+        amount: e.amount,
+        date: e.date,
+        remarks: e.remarks || "",
+        category: e.category || "",
+      }));
+
+    // ── 5. Summary for selected month ──
+    const daysInMonth = new Date(year, month, 0).getDate();
+    const activeDays = dailyBreakdown.length;
+    const avgDailySpend = activeDays > 0 ? monthTotal / daysInMonth : 0;
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        selectedMonth: { year, month },
+        summary: {
+          total: Math.round(monthTotal * 100) / 100,
+          count: allMonthExpenses.length,
+          avgDailySpend: Math.round(avgDailySpend * 100) / 100,
+          activeDays,
+        },
+        monthlyTrend: monthlyTrend.map((m) => ({
+          month: `${m._id.year}-${String(m._id.month).padStart(2, "0")}`,
+          year: m._id.year,
+          monthNum: m._id.month,
+          total: Math.round(m.total * 100) / 100,
+          count: m.count,
+        })),
+        dailyBreakdown: dailyBreakdown.map((d) => ({
+          date: d._id,
+          total: Math.round(d.total * 100) / 100,
+          count: d.count,
+        })),
+        categoryBreakdown,
+        top5Expenses: top5,
+      },
+    });
+  },
+);
+
+// ==========================================
 // Get Ledgers
 // ==========================================
 export const getLedgers = TryCatch(async (req: Request, res: Response) => {
@@ -377,6 +519,39 @@ export const closeLedger = TryCatch(
       success: true,
       message: "Ledger closed successfully",
       ledger,
+    });
+  },
+);
+
+// ==========================================
+// Check for Duplicates
+// ==========================================
+export const checkDuplicate = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const userId = req.user.id;
+    const { amount, date } = req.query;
+
+    if (!amount || !date) {
+      return next(new ErrorHandler("Amount and date are required", 400));
+    }
+
+    const expenseDate = new Date(date as string);
+    // Start of day
+    const startOfDay = new Date(expenseDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    // End of day
+    const endOfDay = new Date(expenseDate);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    const duplicates = await Expense.find({
+      userId,
+      amount: Number(amount),
+      date: { $gte: startOfDay, $lte: endOfDay },
+    }).select("amount date remarks category");
+
+    return res.status(200).json({
+      success: true,
+      duplicates,
     });
   },
 );

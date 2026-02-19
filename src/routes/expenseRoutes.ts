@@ -5,7 +5,9 @@ import {
   editExpense,
   deleteExpense,
   getStats,
+  getAdvancedStats,
   getLedgers,
+  checkDuplicate,
   closeLedger,
   exportPDF,
 } from "../controllers/expenseController.js";
@@ -19,8 +21,12 @@ router.get("/", isAuthenticated, getExpenses);
 router.put("/:id", isAuthenticated, editExpense);
 router.delete("/:id", isAuthenticated, deleteExpense);
 
+// Duplicate Check
+router.get("/check-duplicate", isAuthenticated, checkDuplicate);
+
 // Stats
 router.get("/stats", isAuthenticated, getStats);
+router.get("/advanced-stats", isAuthenticated, getAdvancedStats);
 
 // Ledger management
 router.get("/ledgers", isAuthenticated, getLedgers);
