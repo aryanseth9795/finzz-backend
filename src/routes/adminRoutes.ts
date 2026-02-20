@@ -10,6 +10,8 @@ import {
   deleteUser,
   getAllExpenses,
   getAllPools,
+  getPoolDashboardStats,
+  getAdminPoolDetail,
   sendBulkNotification,
 } from "../controllers/adminController.js";
 
@@ -33,6 +35,8 @@ router.get("/expenses", adminOnly, getAllExpenses);
 
 // Pools
 router.get("/pools", adminOnly, getAllPools);
+router.get("/pools/dashboard", adminOnly, getPoolDashboardStats);
+router.get("/pools/:id", adminOnly, getAdminPoolDetail);
 
 // Notifications
 router.post("/notifications/bulk", adminOnly, sendBulkNotification);

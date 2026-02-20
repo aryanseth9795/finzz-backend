@@ -12,17 +12,18 @@ import statsRoutes from "./src/routes/statsRoutes.js";
 import poolRoutes from "./src/routes/poolRoutes.js";
 import expenseRoutes from "./src/routes/expenseRoutes.js";
 import adminRoutes from "./src/routes/adminRoutes.js";
+import { MongoURL } from "./src/config/envVariables.js";
 
 // Middleware
 import errorMiddleware from "./src/middlewares/error.js";
 
 // DB
 import connectDb from "./src/db/db.js";
-import { MongoURL } from "./src/config/envVariables.js";
 
-dotenv.config();
+
 
 // Connect to MongoDB
+console.log("Connecting to MongoDB...", MongoURL );
 connectDb(MongoURL);
 
 const app = express();

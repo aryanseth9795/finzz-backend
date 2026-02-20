@@ -11,6 +11,7 @@ import { Notification } from "../models/notificationModel.js";
 import ErrorHandler from "../middlewares/Errorhandler.js";
 import { JWT_SECRET, adminSecretKey } from "../config/envVariables.js";
 import { Expo, ExpoPushMessage } from "expo-server-sdk";
+import { PoolTx } from "../models/poolTxModel.js";
 
 const expo = new Expo();
 
@@ -393,8 +394,8 @@ export const getAllPools = TryCatch(
         .sort({ _id: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
-        .populate("createdBy", "name phone")
-        .populate("members.userId", "name phone")
+        .populate("admin", "name phone avatar")
+        .populate("members", "name phone avatar")
         .lean(),
       Pool.countDocuments(),
     ]);
@@ -408,6 +409,89 @@ export const getAllPools = TryCatch(
         total,
         pages: Math.ceil(total / limit),
       },
+    });
+  },
+);
+
+// ==========================================
+// Get All Pools Dashboard Stats
+// ==========================================
+export const getPoolDashboardStats = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const [activePools, closedPools, allPoolTxns] = await Promise.all([
+      Pool.countDocuments({ status: "active" }),
+      Pool.countDocuments({ status: "closed" }),
+      PoolTx.find().lean(),
+    ]);
+
+    let totalCredited = 0;
+    let totalDebited = 0;
+
+    allPoolTxns.forEach((tx) => {
+      if (tx.type === "credit") {
+        totalCredited += tx.amount;
+      } else if (tx.type === "debit") {
+        totalDebited += tx.amount;
+      }
+    });
+
+    const netBalance = totalCredited - totalDebited;
+
+    res.status(200).json({
+      success: true,
+      stats: {
+        activePools,
+        closedPools,
+        totalCredited,
+        totalDebited,
+        netBalance,
+      },
+    });
+  },
+);
+
+// ==========================================
+// Get Admin Pool Detail
+// ==========================================
+export const getAdminPoolDetail = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const { id } = req.params;
+
+    const pool = await Pool.findById(id)
+      .populate("admin", "name phone avatar")
+      .populate("members", "name phone avatar")
+      .lean();
+
+    if (!pool) {
+      return next(new ErrorHandler("Pool not found", 404));
+    }
+
+    const txns = await PoolTx.find({ poolId: id })
+      .populate("addedBy", "name phone avatar")
+      .populate("verifiedBy", "name phone avatar")
+      .sort({ date: -1 })
+      .lean();
+
+    let poolCredited = 0;
+    let poolDebited = 0;
+
+    txns.forEach((tx) => {
+      if (tx.type === "credit") {
+        poolCredited += tx.amount;
+      } else if (tx.type === "debit") {
+        poolDebited += tx.amount;
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      pool,
+      stats: {
+        totalCredited: poolCredited,
+        totalDebited: poolDebited,
+        netBalance: poolCredited - poolDebited,
+      },
+      transactions: txns,
     });
   },
 );
