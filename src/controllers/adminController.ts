@@ -18,10 +18,10 @@ const expo = new Expo();
 // ==========================================
 // Admin Login (secret key)
 // ==========================================
+// console.log(adminSecretKey)
 export const adminLogin = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { secretKey } = req.body;
-
     if (!secretKey || secretKey !== adminSecretKey) {
       return next(new ErrorHandler("Invalid admin secret key", 401));
     }

@@ -2,8 +2,8 @@ import dotenv from "dotenv";
 
 
 dotenv.config({path: "./.env"});
-console.log(process.env.MONGO_URL);
 
+console.log(process.env.ADMIN_SECRET_KEY)
 
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key";
 const JWT_EXPIRES_IN: string | number | undefined =

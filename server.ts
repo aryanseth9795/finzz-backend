@@ -23,7 +23,7 @@ import connectDb from "./src/db/db.js";
 
 
 // Connect to MongoDB
-console.log("Connecting to MongoDB...", MongoURL );
+
 connectDb(MongoURL);
 
 const app = express();
@@ -33,6 +33,8 @@ app.use(
   cors({
     origin: ["https://finzzadmin.netlify.app/", "http://localhost:5173"],
     credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
 app.use(express.json());
