@@ -393,13 +393,15 @@ export const getAdvancedStats = TryCatch(
       monthTotal += exp.amount;
       // Extract category label: use remarks prefix (#Tag) or category field or "Other"
       let label = "Other";
+      if (exp.category && exp.category !== "-") {
+        label = exp.category;
+      }
+
       if (exp.remarks) {
         const match = exp.remarks.match(/^#\s*(.+)/);
         if (match) {
           label = match[1].trim();
         }
-      } else if (exp.category) {
-        label = exp.category;
       }
       if (!categoryMap[label]) categoryMap[label] = { total: 0, count: 0 };
       categoryMap[label].total += exp.amount;

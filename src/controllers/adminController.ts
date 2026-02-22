@@ -503,8 +503,8 @@ export const sendBulkNotification = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { title, body } = req.body;
 
-    if (!title || !body) {
-      return next(new ErrorHandler("Title and body are required", 400));
+    if (!title) {
+      return next(new ErrorHandler("Title is required", 400));
     }
 
     // Get all users with push tokens
@@ -549,6 +549,74 @@ export const sendBulkNotification = TryCatch(
       success: true,
       message: `Notification sent to ${sentCount} users`,
       totalUsersWithTokens: users.length,
+      sentCount,
+    });
+  },
+);
+
+// ==========================================
+// Send Targeted Notification to specific users
+// ==========================================
+export const sendTargetedNotification = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const { userIds, title, body } = req.body;
+
+    if (!title) {
+      return next(new ErrorHandler("Title is required", 400));
+    }
+
+    if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+      return next(new ErrorHandler("Please select at least one user", 400));
+    }
+
+    // Get selected users with push tokens
+    const users = await User.find({
+      _id: { $in: userIds },
+      pushToken: { $exists: true, $ne: "" },
+    })
+      .select("_id pushToken")
+      .lean();
+
+    if (users.length === 0) {
+      return next(
+        new ErrorHandler(
+          "None of the selected users have valid push tokens",
+          404,
+        ),
+      );
+    }
+
+    // Build messages
+    const messages: ExpoPushMessage[] = [];
+    for (const user of users) {
+      const token = (user as any).pushToken;
+      if (token && Expo.isExpoPushToken(token)) {
+        messages.push({
+          to: token,
+          sound: "default",
+          title,
+          body,
+          data: { type: "admin_targeted" },
+        });
+      }
+    }
+
+    // Send in chunks
+    const chunks = expo.chunkPushNotifications(messages);
+    let sentCount = 0;
+    for (const chunk of chunks) {
+      try {
+        await expo.sendPushNotificationsAsync(chunk);
+        sentCount += chunk.length;
+      } catch (error) {
+        console.error("Error sending targeted notifications:", error);
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Notification sent to ${sentCount} out of ${userIds.length} selected users`,
+      totalSelectedUsers: userIds.length,
       sentCount,
     });
   },

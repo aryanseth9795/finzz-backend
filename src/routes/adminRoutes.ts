@@ -13,6 +13,7 @@ import {
   getPoolDashboardStats,
   getAdminPoolDetail,
   sendBulkNotification,
+  sendTargetedNotification,
 } from "../controllers/adminController.js";
 
 const router = express.Router();
@@ -40,5 +41,6 @@ router.get("/pools/:id", adminOnly, getAdminPoolDetail);
 
 // Notifications
 router.post("/notifications/bulk", adminOnly, sendBulkNotification);
+router.post("/notifications/targeted", adminOnly, sendTargetedNotification);
 
 export default router;
