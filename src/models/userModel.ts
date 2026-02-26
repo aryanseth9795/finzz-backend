@@ -6,11 +6,16 @@ export interface IUser extends Document {
   name: string;
   phone: string; // PRIMARY LOGIN IDENTIFIER (mobile number)
   password: string;
+  email?: string;
+  emailVerified: boolean;
+  otp?: string; // bcrypt-hashed OTP
+  otpExpiry?: Date;
   avatar?: string;
   friends: mongoose.Types.ObjectId[];
   pushToken?: string;
   refreshToken?: string;
   comparePassword(candidatePassword: string): Promise<boolean>;
+  compareOtp(candidateOtp: string): Promise<boolean>;
 }
 
 const userSchema = new Schema<IUser>({
@@ -38,6 +43,23 @@ const userSchema = new Schema<IUser>({
       ref: "User",
     },
   ],
+  email: {
+    type: String,
+    unique: true,
+    sparse: true, // allows multiple null values
+    lowercase: true,
+    trim: true,
+  },
+  emailVerified: {
+    type: Boolean,
+    default: false,
+  },
+  otp: {
+    type: String, // stored as bcrypt hash
+  },
+  otpExpiry: {
+    type: Date,
+  },
   pushToken: {
     type: String,
   },
@@ -59,6 +81,14 @@ userSchema.methods.comparePassword = async function (
   candidatePassword: string,
 ): Promise<boolean> {
   return compare(candidatePassword, this.password);
+};
+
+// Instance method for OTP comparison
+userSchema.methods.compareOtp = async function (
+  candidateOtp: string,
+): Promise<boolean> {
+  if (!this.otp) return false;
+  return compare(candidateOtp, this.otp);
 };
 
 export const User =

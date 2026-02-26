@@ -12,6 +12,7 @@ export const registerSchema = z.object({
         /^\+?[1-9]\d{1,14}$/,
         "Invalid phone number format (use E.164 format)",
       ),
+    email: z.string().email("Invalid email address"),
     password: z.string().min(6, "Password must be at least 6 characters"),
   }),
 });
@@ -55,6 +56,43 @@ export const updatePushTokenSchema = z.object({
     pushToken: z
       .string()
       .startsWith("ExponentPushToken[", "Invalid Expo push token format"),
+  }),
+});
+
+export const sendOtpSchema = z.object({
+  body: z.object({
+    email: z.string().email("Invalid email address"),
+  }),
+});
+
+export const verifyOtpSchema = z.object({
+  body: z.object({
+    email: z.string().email("Invalid email address"),
+    otp: z.string().length(6, "OTP must be 6 digits"),
+  }),
+});
+
+export const resetPasswordSchema = z.object({
+  body: z.object({
+    email: z.string().email("Invalid email address"),
+    otp: z.string().length(6, "OTP must be 6 digits"),
+    newPassword: z.string().min(6, "Password must be at least 6 characters"),
+  }),
+});
+
+export const changePasswordSchema = z.object({
+  body: z.object({
+    oldPassword: z.string().min(1, "Old password is required"),
+    newPassword: z
+      .string()
+      .min(6, "New password must be at least 6 characters"),
+  }),
+});
+
+export const verifyEmailSchema = z.object({
+  body: z.object({
+    email: z.string().email("Invalid email address"),
+    otp: z.string().length(6, "OTP must be 6 digits"),
   }),
 });
 

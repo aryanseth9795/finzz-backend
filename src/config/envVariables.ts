@@ -1,9 +1,8 @@
 import dotenv from "dotenv";
 
+dotenv.config({ path: "./.env" });
 
-dotenv.config({path: "./.env"});
-
-console.log(process.env.ADMIN_SECRET_KEY)
+console.log(process.env.ADMIN_SECRET_KEY);
 
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key";
 const JWT_EXPIRES_IN: string | number | undefined =
@@ -11,8 +10,16 @@ const JWT_EXPIRES_IN: string | number | undefined =
 const COOKIE_EXPIRES_IN = process.env.COOKIE_EXPIRES_IN
   ? parseInt(process.env.COOKIE_EXPIRES_IN)
   : 7; // Default to 7 days
-const adminSecretKey = process.env.ADMIN_SECRET_KEY! ;
+const adminSecretKey = process.env.ADMIN_SECRET_KEY!;
 
 const MongoURL = process.env.MONGO_URL! || "mongodb://localhost:27017/finzz";
+const RESEND_API_KEY = process.env.RESEND_API || "";
 
-export { JWT_SECRET, JWT_EXPIRES_IN, COOKIE_EXPIRES_IN, adminSecretKey, MongoURL };
+export {
+  JWT_SECRET,
+  JWT_EXPIRES_IN,
+  COOKIE_EXPIRES_IN,
+  adminSecretKey,
+  MongoURL,
+  RESEND_API_KEY,
+};

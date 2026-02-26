@@ -36,6 +36,8 @@ const sendToken = async (res: Response, user: IUser, statusCode: number) => {
       name: user.name,
       phone: user.phone,
       avatar: user.avatar,
+      email: user.email,
+      emailVerified: user.emailVerified,
       // Do NOT send password or refreshToken
     },
   });
