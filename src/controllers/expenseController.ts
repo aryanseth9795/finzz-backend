@@ -469,10 +469,23 @@ export const getAdvancedStats = TryCatch(
 // ==========================================
 export const getLedgers = TryCatch(async (req: Request, res: Response) => {
   const userId = req.user.id;
+  const { year, month } = req.query;
 
-  // Proactively get or create the ledger for the current month
-  const now = new Date();
-  await getOrCreateLedger(userId, now);
+  // Proactively get or create the ledger for the requested/current month
+  let targetYear: number, targetMonth: number;
+
+  if (year && month) {
+    targetYear = parseInt(year as string);
+    targetMonth = parseInt(month as string);
+  } else {
+    const now = new Date();
+    targetYear = now.getFullYear();
+    targetMonth = now.getMonth() + 1;
+  }
+
+  // Use a pseudo-date to pass to the existing helper, or just recreate the logic
+  const pseudoDate = new Date(targetYear, targetMonth - 1, 1);
+  await getOrCreateLedger(userId, pseudoDate);
 
   const ledgers = await ExpenseLedger.find({ userId })
     .sort({ year: -1, month: -1 })
