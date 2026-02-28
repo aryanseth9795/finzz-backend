@@ -470,6 +470,10 @@ export const getAdvancedStats = TryCatch(
 export const getLedgers = TryCatch(async (req: Request, res: Response) => {
   const userId = req.user.id;
 
+  // Proactively get or create the ledger for the current month
+  const now = new Date();
+  await getOrCreateLedger(userId, now);
+
   const ledgers = await ExpenseLedger.find({ userId })
     .sort({ year: -1, month: -1 })
     .lean();
