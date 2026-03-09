@@ -33,13 +33,14 @@ async function getOrCreateLedger(userId: string, date: Date) {
 // ==========================================
 export const addExpense = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    const { amount, date, remarks, category } = req.body;
+    const { amount, date, remarks, category, type } = req.body;
     const userId = req.user.id;
 
     if (!amount || !date) {
       return next(new ErrorHandler("Amount and date are required", 400));
     }
 
+    const expenseType = type === "credit" ? "credit" : "debit";
     const expenseDate = new Date(date);
 
     // Get or create the ledger for this month
@@ -57,13 +58,18 @@ export const addExpense = TryCatch(
       userId,
       ledgerId: ledger._id,
       amount,
+      type: expenseType,
       date: expenseDate,
       remarks,
       category,
     });
 
-    // Update ledger total
-    ledger.totalExpenses += amount;
+    // Update ledger total based on type
+    if (expenseType === "credit") {
+      ledger.totalCredits += amount;
+    } else {
+      ledger.totalExpenses += amount;
+    }
     await ledger.save();
 
     return res.status(201).json({
@@ -122,7 +128,7 @@ export const editExpense = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { id } = req.params;
     const userId = req.user.id;
-    const { amount, date, remarks, category } = req.body;
+    const { amount, date, remarks, category, type } = req.body;
 
     const expense = await Expense.findById(id);
 
@@ -147,18 +153,34 @@ export const editExpense = TryCatch(
     }
 
     const oldAmount = expense.amount;
+    const oldType = expense.type || "debit";
 
     // Update expense fields
     if (amount !== undefined) expense.amount = amount;
     if (date !== undefined) expense.date = new Date(date);
     if (remarks !== undefined) expense.remarks = remarks;
     if (category !== undefined) expense.category = category;
+    if (type !== undefined) expense.type = type;
 
     await expense.save();
 
-    // Update ledger total if amount changed
-    if (amount !== undefined && amount !== oldAmount) {
-      ledger.totalExpenses = ledger.totalExpenses - oldAmount + amount;
+    const newAmount = expense.amount;
+    const newType = expense.type || "debit";
+
+    // Update ledger totals if amount or type changed
+    if (amount !== undefined || type !== undefined) {
+      // Reverse old entry
+      if (oldType === "credit") {
+        ledger.totalCredits -= oldAmount;
+      } else {
+        ledger.totalExpenses -= oldAmount;
+      }
+      // Apply new entry
+      if (newType === "credit") {
+        ledger.totalCredits += newAmount;
+      } else {
+        ledger.totalExpenses += newAmount;
+      }
       await ledger.save();
     }
 
@@ -202,8 +224,13 @@ export const deleteExpense = TryCatch(
       );
     }
 
-    // Update ledger total
-    ledger.totalExpenses -= expense.amount;
+    // Update ledger total based on expense type
+    const expenseType = expense.type || "debit";
+    if (expenseType === "credit") {
+      ledger.totalCredits -= expense.amount;
+    } else {
+      ledger.totalExpenses -= expense.amount;
+    }
     await ledger.save();
 
     // Delete the expense

@@ -7,6 +7,7 @@ export interface IExpenseLedger extends Document {
   status: "open" | "closed";
   closedAt?: Date;
   totalExpenses: number;
+  totalCredits: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -41,6 +42,11 @@ const expenseLedgerSchema = new Schema<IExpenseLedger>(
       type: Date,
     },
     totalExpenses: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    totalCredits: {
       type: Number,
       default: 0,
       min: 0,

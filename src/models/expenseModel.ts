@@ -4,6 +4,7 @@ export interface IExpense extends Document {
   userId: mongoose.Types.ObjectId;
   ledgerId: mongoose.Types.ObjectId;
   amount: number;
+  type: "debit" | "credit";
   date: Date;
   remarks?: string;
   category?: string;
@@ -29,6 +30,12 @@ const expenseSchema = new Schema<IExpense>(
       type: Number,
       required: true,
       min: 0,
+    },
+    type: {
+      type: String,
+      enum: ["debit", "credit"],
+      default: "debit",
+      required: true,
     },
     date: {
       type: Date,
