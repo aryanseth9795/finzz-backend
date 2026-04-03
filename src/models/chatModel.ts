@@ -9,6 +9,9 @@ export interface IChat extends Document {
     amount: number;
     date: Date;
     remark: string;
+    to?: mongoose.Types.ObjectId;
+    from?: mongoose.Types.ObjectId;
+    status?: "pending" | "verified" | "rejected";
   };
   createdAt: Date;
   updatedAt: Date;
@@ -38,6 +41,18 @@ const schema = new Schema<IChat>(
       amount: Number,
       date: Date,
       remark: String,
+      to: {
+        type: Types.ObjectId,
+        ref: "User",
+      },
+      from: {
+        type: Types.ObjectId,
+        ref: "User",
+      },
+      status: {
+        type: String,
+        enum: ["pending", "verified", "rejected"],
+      },
     },
   },
   {

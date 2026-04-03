@@ -35,6 +35,14 @@ export const addTxnSchema = z.object({
   }),
 });
 
+export const reviewTxnSchema = z.object({
+  body: z.object({
+    txnId: z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid txnId"),
+    action: z.enum(["verify", "reject"]).default("verify"),
+    remark: z.string().max(200, "Remark too long").optional(),
+  }),
+});
+
 export const checkContactsSchema = z.object({
   body: z.object({
     phoneNumbers: z

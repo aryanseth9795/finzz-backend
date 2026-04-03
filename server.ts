@@ -12,6 +12,7 @@ import statsRoutes from "./src/routes/statsRoutes.js";
 import poolRoutes from "./src/routes/poolRoutes.js";
 import expenseRoutes from "./src/routes/expenseRoutes.js";
 import adminRoutes from "./src/routes/adminRoutes.js";
+import notificationRoutes from "./src/routes/notificationRoutes.js";
 import { MongoURL } from "./src/config/envVariables.js";
 
 // Middleware
@@ -53,6 +54,7 @@ app.use("/api/v1/stats", statsRoutes); // Transaction statistics
 app.use("/api/v1/pools", poolRoutes); // Pool management
 app.use("/api/v1/expenses", expenseRoutes); // Daily expense tracker
 app.use("/api/v1/admin", adminRoutes); // Admin panel
+app.use("/api/v1/notifications", notificationRoutes); // User notification feed
 
 // Error handling middleware (must be last)
 app.use(errorMiddleware);

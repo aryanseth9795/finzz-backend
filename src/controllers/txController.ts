@@ -1,4 +1,5 @@
 import { NextFunction, Request, Response } from "express";
+import mongoose from "mongoose";
 import TryCatch from "../utils/TryCatch.js";
 import { Tx } from "../models/txModel.js";
 import { Chat } from "../models/chatModel.js";
@@ -8,9 +9,121 @@ import { sendPushNotification } from "../services/notificationService.js";
 import {
   updateSummaryOnAdd,
   updateSummaryOnDelete,
-  updateSummaryOnEdit,
 } from "../services/summaryService.js";
-import mongoose from "mongoose";
+
+type TxStatus = "pending" | "verified" | "rejected";
+
+type TxLike = {
+  _id?: mongoose.Types.ObjectId | string;
+  chatId?: mongoose.Types.ObjectId | string;
+  amount?: number;
+  remarks?: string;
+  date?: Date | string;
+  to?: mongoose.Types.ObjectId | string;
+  from?: mongoose.Types.ObjectId | string;
+  addedBy?: mongoose.Types.ObjectId | string;
+  status?: string;
+  verified?: boolean;
+  verifiedBy?: mongoose.Types.ObjectId | string;
+  verifiedAt?: Date | string;
+  rejectedBy?: mongoose.Types.ObjectId | string;
+  rejectedAt?: Date | string;
+  rejectionRemark?: string;
+};
+
+const getTxnStatus = (txn: TxLike): TxStatus => {
+  if (txn.status === "verified" || txn.status === "rejected") {
+    return txn.status;
+  }
+
+  return txn.verified ? "verified" : "pending";
+};
+
+const serializeTxn = <T extends TxLike>(txn: T) => {
+  const status = getTxnStatus(txn);
+
+  return {
+    ...txn,
+    status,
+    verified: status === "verified",
+  };
+};
+
+async function getChatMemberIds(
+  chatId: mongoose.Types.ObjectId | string,
+): Promise<string[]> {
+  const chat = await Chat.findById(chatId)
+    .select("members")
+    .lean<{ members: mongoose.Types.ObjectId[] } | null>();
+
+  if (!chat) {
+    throw new ErrorHandler("Chat not found", 404);
+  }
+
+  return chat.members.map((member) => member.toString());
+}
+
+function ensureCurrentMonth(txDate: Date, message: string) {
+  const now = new Date();
+  const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  if (txDate < currentMonthStart) {
+    throw new ErrorHandler(message, 400);
+  }
+}
+
+function validateTxnParticipants(
+  memberIds: string[],
+  from: string,
+  to: string,
+) {
+  if (from === to) {
+    throw new ErrorHandler("Sender and receiver must be different", 400);
+  }
+
+  if (!memberIds.includes(from) || !memberIds.includes(to)) {
+    throw new ErrorHandler("Transaction users must belong to this chat", 400);
+  }
+}
+
+function getOtherMemberId(memberIds: string[], userId: string) {
+  return memberIds.find((memberId) => memberId !== userId) || null;
+}
+
+async function syncChatLastTransaction(
+  chatId: mongoose.Types.ObjectId | string,
+) {
+  const latestTxn = await Tx.findOne({ chatId })
+    .sort({ date: -1, _id: -1 })
+    .select("amount date remarks to from status verified")
+    .lean<TxLike | null>();
+
+  if (!latestTxn) {
+    await Chat.findByIdAndUpdate(chatId, {
+      $unset: { lastTransaction: "" },
+    });
+    return;
+  }
+
+  await Chat.findByIdAndUpdate(chatId, {
+    lastTransaction: {
+      amount: latestTxn.amount,
+      date: latestTxn.date,
+      remark: latestTxn.remarks || "",
+      to: latestTxn.to,
+      from: latestTxn.from,
+      status: getTxnStatus(latestTxn),
+    },
+  });
+}
+
+async function getUserName(userId: string) {
+  const user = await User.findById(userId)
+    .select("name")
+    .lean<{ name: string } | null>();
+
+  return user?.name || "Your friend";
+}
 
 // Add transaction
 export const addtxns = TryCatch(
@@ -18,71 +131,42 @@ export const addtxns = TryCatch(
     const { chatId, to, from, amount, date, remarks } = req.body;
     const userId = req.user.id;
 
-    // Validate transaction date is not in a closed month (past month)
     const txDate = new Date(date);
-    const now = new Date();
-    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-
-    if (txDate < currentMonthStart) {
-      return next(
-        new ErrorHandler(
-          "Cannot add transactions to closed months. Only current month is allowed.",
-          400,
-        ),
-      );
-    }
-
-    // Validate user is member of the chat
-    const chat = await Chat.findById(chatId)
-      .select("members")
-      .lean<{ members: any[] }>();
-    if (!chat) {
-      return next(new ErrorHandler("Chat not found", 404));
-    }
-
-    const isMember = chat.members.some(
-      (member) => member.toString() === userId,
+    ensureCurrentMonth(
+      txDate,
+      "Cannot add transactions to closed months. Only current month is allowed.",
     );
-    if (!isMember) {
+
+    const memberIds = await getChatMemberIds(chatId);
+    if (!memberIds.includes(userId)) {
       return next(new ErrorHandler("You are not a member of this chat", 403));
     }
 
-    // Create transaction
+    validateTxnParticipants(memberIds, from, to);
+
     const txn = await Tx.create({
       chatId,
       to,
       from,
       amount,
-      date,
+      date: txDate,
       remarks,
       addedBy: userId,
+      status: "pending",
       verified: false,
     });
 
-    // Update monthly summary (atomic $inc)
-    await updateSummaryOnAdd(chatId, new Date(date), from, to, amount);
-
-    // Update chat's lastTransaction
-    await Chat.findByIdAndUpdate(chatId, {
-      lastTransaction: {
-        amount,
-        date,
-        remark: remarks || "",
-      },
-    });
+    await updateSummaryOnAdd(chatId, txDate, from, to, amount);
+    await syncChatLastTransaction(txn.chatId);
 
     // Send push notification to the other member
-    const otherMember = chat.members.find(
-      (member: any) => member.toString() !== userId,
-    );
-    if (otherMember) {
-      const senderName = await User.findById(userId)
-        .select("name")
-        .lean<{ name: string }>();
+    const otherMemberId = getOtherMemberId(memberIds, userId);
+    if (otherMemberId) {
+      const senderName = await getUserName(userId);
       await sendPushNotification(
-        otherMember.toString(),
-        "New Transaction",
-        `₹${amount} added by ${senderName?.name}`,
+        otherMemberId,
+        "Transaction Pending Review",
+        `Rs. ${amount} added by ${senderName}`,
         {
           type: "txn_added",
           senderId: userId,
@@ -95,7 +179,7 @@ export const addtxns = TryCatch(
     res.status(201).json({
       success: true,
       message: "Transaction created successfully",
-      txn,
+      txn: serializeTxn(txn.toObject()),
     });
   },
 );
@@ -105,16 +189,23 @@ export const getTxns = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { chatId } = req.params;
     const cursor = req.query.cursor as string | undefined;
-    const limit = parseInt(req.query.limit as string) || 20;
+    const limit = Number.parseInt(req.query.limit as string, 10) || 20;
     const year = req.query.year
-      ? parseInt(req.query.year as string)
+      ? Number.parseInt(req.query.year as string, 10)
       : undefined;
     const month = req.query.month
-      ? parseInt(req.query.month as string)
+      ? Number.parseInt(req.query.month as string, 10)
       : undefined;
+    const userId = req.user.id;
 
-    // Build query
-    const query: any = { chatId: new mongoose.Types.ObjectId(chatId) };
+    const memberIds = await getChatMemberIds(chatId);
+    if (!memberIds.includes(userId)) {
+      return next(new ErrorHandler("You are not a member of this chat", 403));
+    }
+
+    const query: Record<string, unknown> = {
+      chatId: new mongoose.Types.ObjectId(chatId),
+    };
 
     // Month filter (if year and month provided)
     if (year && month) {
@@ -126,44 +217,44 @@ export const getTxns = TryCatch(
     // Cursor pagination (within the month if filtered)
     if (cursor) {
       const cursorDate = new Date(cursor);
-      if (query.date) {
-        // Combine month filter with cursor
-        query.date.$lt = cursorDate;
+      if (query.date && typeof query.date === "object") {
+        (query.date as Record<string, Date>).$lt = cursorDate;
       } else {
         query.date = { $lt: cursorDate };
       }
     }
 
-    // Fetch limit + 1 to check if there are more pages
     const txns = await Tx.find(query)
       .sort({ date: -1, _id: -1 })
       .limit(limit + 1)
       .populate("addedBy", "name")
       .populate("verifiedBy", "name")
-      .populate("chatId", "members")
-      .lean();
+      .populate("rejectedBy", "name")
+      .lean<TxLike[]>();
 
     const hasMore = txns.length > limit;
-    if (hasMore) txns.pop(); // Remove extra item
+    if (hasMore) txns.pop();
 
     const nextCursor =
-      hasMore && txns.length > 0
-        ? txns[txns.length - 1].date.toISOString()
+      hasMore && txns.length > 0 && txns[txns.length - 1].date
+        ? new Date(txns[txns.length - 1].date as string | Date).toISOString()
         : null;
 
     return res.status(200).json({
       success: true,
-      txns,
+      txns: txns.map((txn) => serializeTxn(txn)),
       nextCursor,
       hasMore,
     });
   },
 );
 
-// Verify transaction
-export const verifyTxn = TryCatch(
+// Review transaction
+export const reviewTxn = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { txnId } = req.body;
+    const action = req.body.action === "reject" ? "reject" : "verify";
+    const rejectionRemark = req.body.remark || "";
     const userId = req.user.id;
 
     const txn = await Tx.findById(txnId);
@@ -172,48 +263,80 @@ export const verifyTxn = TryCatch(
       return next(new ErrorHandler("Transaction not found", 404));
     }
 
-    // Guard: only the member who did NOT add the txn can verify
+    const memberIds = await getChatMemberIds(txn.chatId);
+    if (!memberIds.includes(userId)) {
+      return next(new ErrorHandler("You are not a member of this chat", 403));
+    }
+
     if (txn.addedBy.toString() === userId) {
       return next(
-        new ErrorHandler("You cannot verify your own transaction", 403),
+        new ErrorHandler(`You cannot ${action} your own transaction`, 403),
       );
     }
 
-    // Guard: already verified
-    if (txn.verified) {
-      return next(new ErrorHandler("Transaction is already verified", 400));
+    const currentStatus = getTxnStatus(txn);
+    if (currentStatus !== "pending") {
+      return next(
+        new ErrorHandler(
+          `Only pending transactions can be ${action === "verify" ? "verified" : "rejected"}`,
+          400,
+        ),
+      );
     }
 
-    // Verify the transaction
-    txn.verified = true;
-    txn.verifiedBy = new mongoose.Types.ObjectId(userId);
-    txn.verifiedAt = new Date();
-    await txn.save();
+    if (action === "verify") {
+      txn.status = "verified";
+      txn.verifiedBy = new mongoose.Types.ObjectId(userId);
+      txn.verifiedAt = new Date();
+    } else {
+      txn.status = "rejected";
+      txn.rejectedBy = new mongoose.Types.ObjectId(userId);
+      txn.rejectedAt = new Date();
+      (txn as any).rejectionRemark = rejectionRemark;
 
-    // Send push notification to the person who added the txn
-    const verifierName = await User.findById(userId)
-      .select("name")
-      .lean<{ name: string }>();
+      await updateSummaryOnDelete(
+        txn.chatId,
+        txn.date,
+        txn.from.toString(),
+        txn.to.toString(),
+        txn.amount,
+      );
+    }
+
+    await txn.save();
+    await syncChatLastTransaction(txn.chatId);
+
+    const reviewerName = await getUserName(userId);
+    const rejectMsg = rejectionRemark
+      ? `${reviewerName} rejected your Rs. ${txn.amount} transaction — "${rejectionRemark}"`
+      : `${reviewerName} rejected your Rs. ${txn.amount} transaction`;
     await sendPushNotification(
       txn.addedBy.toString(),
-      "Transaction Verified",
-      `₹${txn.amount} verified by ${verifierName?.name}`,
+      action === "verify" ? "Transaction Verified" : "Transaction Rejected",
+      action === "verify"
+        ? `Rs. ${txn.amount} verified by ${reviewerName}`
+        : rejectMsg,
       {
-        type: "txn_verified",
+        type: action === "verify" ? "txn_verified" : "txn_rejected",
         senderId: userId,
+        chatId: txn.chatId.toString(),
         txnId: txnId,
       },
     );
 
     return res.status(200).json({
       success: true,
-      message: "Transaction verified successfully",
-      txn,
+      message:
+        action === "verify"
+          ? "Transaction verified successfully"
+          : "Transaction rejected successfully",
+      txn: serializeTxn(txn.toObject()),
     });
   },
 );
 
-// Edit transaction
+
+// Edit transaction — only allowed when status === "rejected"
 export const editTxn = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { txnId } = req.params;
@@ -234,42 +357,34 @@ export const editTxn = TryCatch(
     }
 
     // Guard: cannot edit verified transactions
-    if (txn.verified) {
-      return next(new ErrorHandler("Cannot edit verified transaction", 403));
+    if (txn.status === "verified") {
+      return next(new ErrorHandler("Cannot edit a verified transaction", 403));
     }
 
-    // Guard: cannot edit transactions in closed months (if date is being changed)
+    // Guard: can only edit rejected transactions (not pending)
+    if (txn.status !== "rejected") {
+      return next(
+        new ErrorHandler(
+          "You can only edit a transaction after it has been rejected",
+          403,
+        ),
+      );
+    }
+
+    // Guard: cannot move date to a closed month
     if (date !== undefined) {
       const newDate = new Date(date);
       const now = new Date();
       const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-
       if (newDate < currentMonthStart) {
         return next(
           new ErrorHandler(
-            "Cannot move transactions to closed months. Only current month is allowed.",
+            "Cannot move transactions to closed months.",
             400,
           ),
         );
       }
     }
-
-    // Also check if the original transaction is in a closed month
-    const now = new Date();
-    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    if (txn.date < currentMonthStart) {
-      return next(
-        new ErrorHandler("Cannot edit transactions from closed months.", 400),
-      );
-    }
-
-    // Capture old values before update for summary recalculation
-    const oldTx = {
-      date: txn.date,
-      from: txn.from.toString(),
-      to: txn.to.toString(),
-      amount: txn.amount,
-    };
 
     // Update fields
     if (amount !== undefined) txn.amount = amount;
@@ -278,43 +393,52 @@ export const editTxn = TryCatch(
     if (to !== undefined) txn.to = to;
     if (from !== undefined) txn.from = from;
 
+    // Reset status to pending for re-review; clear reject metadata
+    txn.status = "pending";
+    txn.verified = false;
+    txn.rejectedBy = undefined;
+    txn.rejectedAt = undefined;
+
     await txn.save();
 
-    // Update monthly summary (handles month/direction/amount changes)
-    await updateSummaryOnEdit(txn.chatId, oldTx, {
-      date: txn.date,
-      from: txn.from.toString(),
-      to: txn.to.toString(),
-      amount: txn.amount,
-    });
+    // Re-apply balance since reject previously rolled it back
+    await updateSummaryOnAdd(
+      txn.chatId,
+      new Date(txn.date),
+      txn.from.toString(),
+      txn.to.toString(),
+      txn.amount,
+    );
 
-    // Update chat's lastTransaction if this is the latest txn
-    const chat = await Chat.findById(txn.chatId).select("lastTransaction");
-    if (chat && chat.lastTransaction?.date) {
-      const latestTxn: any = await Tx.findOne({ chatId: txn.chatId })
-        .sort({ date: -1 })
-        .select("amount date remarks")
-        .lean();
-      if (latestTxn) {
-        await Chat.findByIdAndUpdate(txn.chatId, {
-          lastTransaction: {
-            amount: latestTxn.amount,
-            date: latestTxn.date,
-            remark: latestTxn.remarks || "",
-          },
-        });
-      }
+    await syncChatLastTransaction(txn.chatId);
+
+    // Notify the other member that the transaction was reworked
+    const memberIds = await getChatMemberIds(txn.chatId);
+    const otherMemberId = getOtherMemberId(memberIds, userId);
+    if (otherMemberId) {
+      const senderName = await getUserName(userId);
+      await sendPushNotification(
+        otherMemberId,
+        "Transaction Resubmitted",
+        `${senderName} resubmitted Rs. ${txn.amount} for review`,
+        {
+          type: "txn_reworked",
+          senderId: userId,
+          chatId: txn.chatId.toString(),
+          txnId: txn._id.toString(),
+        },
+      );
     }
 
     return res.status(200).json({
       success: true,
-      message: "Transaction updated successfully",
-      txn,
+      message: "Transaction resubmitted for review",
+      txn: serializeTxn(txn.toObject()),
     });
   },
 );
 
-// Delete transaction
+// Delete transaction — only allowed when status === "rejected"
 export const deleteTxn = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { txnId } = req.params;
@@ -334,42 +458,43 @@ export const deleteTxn = TryCatch(
     }
 
     // Guard: cannot delete verified transactions
-    if (txn.verified) {
-      return next(new ErrorHandler("Cannot delete verified transaction", 403));
+    if (txn.status === "verified") {
+      return next(new ErrorHandler("Cannot delete a verified transaction", 403));
+    }
+
+    // Guard: can only delete rejected transactions (not pending)
+    if (txn.status !== "rejected") {
+      return next(
+        new ErrorHandler(
+          "You can only delete a transaction after it has been rejected",
+          403,
+        ),
+      );
     }
 
     const chatId = txn.chatId;
 
-    // Update monthly summary before deletion
-    await updateSummaryOnDelete(
-      chatId,
-      txn.date,
-      txn.from.toString(),
-      txn.to.toString(),
-      txn.amount,
-    );
-
+    // Do NOT call updateSummaryOnDelete — the reject flow already rolled back the balance.
+    // Simply remove the document.
     await Tx.findByIdAndDelete(txnId);
 
-    // Update chat's lastTransaction
-    const latestTxn: any = await Tx.findOne({ chatId })
-      .sort({ date: -1 })
-      .select("amount date remarks")
-      .lean();
+    await syncChatLastTransaction(chatId);
 
-    if (latestTxn) {
-      await Chat.findByIdAndUpdate(chatId, {
-        lastTransaction: {
-          amount: latestTxn.amount,
-          date: latestTxn.date,
-          remark: latestTxn.remarks || "",
+    // Notify the other member that the transaction was deleted
+    const memberIds = await getChatMemberIds(chatId);
+    const otherMemberId = getOtherMemberId(memberIds, userId);
+    if (otherMemberId) {
+      const senderName = await getUserName(userId);
+      await sendPushNotification(
+        otherMemberId,
+        "Transaction Deleted",
+        `${senderName} deleted a rejected Rs. ${txn.amount} transaction`,
+        {
+          type: "txn_deleted",
+          senderId: userId,
+          chatId: chatId.toString(),
         },
-      });
-    } else {
-      // No transactions left, clear lastTransaction
-      await Chat.findByIdAndUpdate(chatId, {
-        $unset: { lastTransaction: "" },
-      });
+      );
     }
 
     return res.status(200).json({
@@ -380,6 +505,7 @@ export const deleteTxn = TryCatch(
 );
 
 // Get all transactions for a user (grouped by friends, for home screen)
+// Excludes rejected transactions so balances are accurate
 export const getAllTxnsUser = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const userId = new mongoose.Types.ObjectId(req.user.id);
@@ -387,6 +513,7 @@ export const getAllTxnsUser = TryCatch(
     const result = await Tx.aggregate([
       {
         $match: {
+          status: { $ne: "rejected" },
           $or: [{ to: userId }, { from: userId }],
         },
       },

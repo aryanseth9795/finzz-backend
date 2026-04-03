@@ -1,4 +1,4 @@
-import { NextFunction, Request, Response } from "express";
+﻿import { NextFunction, Request, Response } from "express";
 import mongoose from "mongoose";
 import TryCatch from "../utils/TryCatch.js";
 import { Expense } from "../models/expenseModel.js";
@@ -273,8 +273,18 @@ export const getStats = TryCatch(
             _id: {
               $dateToString: { format: "%Y-%m-%d", date: "$date" },
             },
-            total: { $sum: "$amount" },
-            count: { $sum: 1 },
+            debitTotal: {
+              $sum: { $cond: [{ $eq: ["$type", "debit"] }, "$amount", 0] },
+            },
+            creditTotal: {
+              $sum: { $cond: [{ $eq: ["$type", "credit"] }, "$amount", 0] },
+            },
+            debitCount: {
+              $sum: { $cond: [{ $eq: ["$type", "debit"] }, 1, 0] },
+            },
+            creditCount: {
+              $sum: { $cond: [{ $eq: ["$type", "credit"] }, 1, 0] },
+            },
           },
         },
         { $sort: { _id: -1 } },
@@ -282,8 +292,11 @@ export const getStats = TryCatch(
 
       stats.daily = dailyStats.map((d) => ({
         date: d._id,
-        total: d.total,
-        count: d.count,
+        debitTotal: d.debitTotal,
+        creditTotal: d.creditTotal,
+        debitCount: d.debitCount,
+        creditCount: d.creditCount,
+        net: d.creditTotal - d.debitTotal,
       }));
     }
 
@@ -297,8 +310,18 @@ export const getStats = TryCatch(
               year: { $year: "$date" },
               month: { $month: "$date" },
             },
-            total: { $sum: "$amount" },
-            count: { $sum: 1 },
+            debitTotal: {
+              $sum: { $cond: [{ $eq: ["$type", "debit"] }, "$amount", 0] },
+            },
+            creditTotal: {
+              $sum: { $cond: [{ $eq: ["$type", "credit"] }, "$amount", 0] },
+            },
+            debitCount: {
+              $sum: { $cond: [{ $eq: ["$type", "debit"] }, 1, 0] },
+            },
+            creditCount: {
+              $sum: { $cond: [{ $eq: ["$type", "credit"] }, 1, 0] },
+            },
           },
         },
         { $sort: { "_id.year": -1, "_id.month": -1 } },
@@ -306,8 +329,11 @@ export const getStats = TryCatch(
 
       stats.monthly = monthlyStats.map((m) => ({
         month: `${m._id.year}-${String(m._id.month).padStart(2, "0")}`,
-        total: m.total,
-        count: m.count,
+        debitTotal: m.debitTotal,
+        creditTotal: m.creditTotal,
+        debitCount: m.debitCount,
+        creditCount: m.creditCount,
+        net: m.creditTotal - m.debitTotal,
       }));
     }
 
@@ -318,8 +344,18 @@ export const getStats = TryCatch(
         {
           $group: {
             _id: { $year: "$date" },
-            total: { $sum: "$amount" },
-            count: { $sum: 1 },
+            debitTotal: {
+              $sum: { $cond: [{ $eq: ["$type", "debit"] }, "$amount", 0] },
+            },
+            creditTotal: {
+              $sum: { $cond: [{ $eq: ["$type", "credit"] }, "$amount", 0] },
+            },
+            debitCount: {
+              $sum: { $cond: [{ $eq: ["$type", "debit"] }, 1, 0] },
+            },
+            creditCount: {
+              $sum: { $cond: [{ $eq: ["$type", "credit"] }, 1, 0] },
+            },
           },
         },
         { $sort: { _id: -1 } },
@@ -327,18 +363,41 @@ export const getStats = TryCatch(
 
       stats.yearly = yearlyStats.map((y) => ({
         year: y._id,
-        total: y.total,
-        count: y.count,
+        debitTotal: y.debitTotal,
+        creditTotal: y.creditTotal,
+        debitCount: y.debitCount,
+        creditCount: y.creditCount,
+        net: y.creditTotal - y.debitTotal,
       }));
     }
 
-    // Grand total
     const grandTotal = await Expense.aggregate([
       { $match: { userId: userObjectId } },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
+      {
+        $group: {
+          _id: null,
+          debits: {
+            $sum: { $cond: [{ $eq: ["$type", "debit"] }, "$amount", 0] },
+          },
+          credits: {
+            $sum: { $cond: [{ $eq: ["$type", "credit"] }, "$amount", 0] },
+          },
+        },
+      },
     ]);
 
-    stats.grandTotal = grandTotal.length > 0 ? grandTotal[0].total : 0;
+    stats.grandTotals =
+      grandTotal.length > 0
+        ? {
+            debits: grandTotal[0].debits || 0,
+            credits: grandTotal[0].credits || 0,
+            net: (grandTotal[0].credits || 0) - (grandTotal[0].debits || 0),
+          }
+        : {
+            debits: 0,
+            credits: 0,
+            net: 0,
+          };
 
     return res.status(200).json({
       success: true,
@@ -359,10 +418,20 @@ export const getAdvancedStats = TryCatch(
     const now = new Date();
     const year = parseInt(
       (req.query.year as string) || String(now.getFullYear()),
+      10,
     );
     const month = parseInt(
       (req.query.month as string) || String(now.getMonth() + 1),
+      10,
     );
+
+    const selectedLedger = await ExpenseLedger.findOne({
+      userId,
+      year,
+      month,
+    })
+      .select("_id year month status")
+      .lean<{ _id: mongoose.Types.ObjectId; year: number; month: number; status: string } | null>();
 
     // ── 1. Monthly Trend (last 12 months including requested month) ──
     const twelveMonthsAgo = new Date(year, month - 13, 1); // 12 months before requested
@@ -379,8 +448,18 @@ export const getAdvancedStats = TryCatch(
             year: { $year: "$date" },
             month: { $month: "$date" },
           },
-          total: { $sum: "$amount" },
-          count: { $sum: 1 },
+          debitTotal: {
+            $sum: { $cond: [{ $eq: ["$type", "debit"] }, "$amount", 0] },
+          },
+          creditTotal: {
+            $sum: { $cond: [{ $eq: ["$type", "credit"] }, "$amount", 0] },
+          },
+          debitCount: {
+            $sum: { $cond: [{ $eq: ["$type", "debit"] }, 1, 0] },
+          },
+          creditCount: {
+            $sum: { $cond: [{ $eq: ["$type", "credit"] }, 1, 0] },
+          },
         },
       },
       { $sort: { "_id.year": 1, "_id.month": 1 } },
@@ -400,8 +479,18 @@ export const getAdvancedStats = TryCatch(
       {
         $group: {
           _id: { $dateToString: { format: "%Y-%m-%d", date: "$date" } },
-          total: { $sum: "$amount" },
-          count: { $sum: 1 },
+          debitTotal: {
+            $sum: { $cond: [{ $eq: ["$type", "debit"] }, "$amount", 0] },
+          },
+          creditTotal: {
+            $sum: { $cond: [{ $eq: ["$type", "credit"] }, "$amount", 0] },
+          },
+          debitCount: {
+            $sum: { $cond: [{ $eq: ["$type", "debit"] }, 1, 0] },
+          },
+          creditCount: {
+            $sum: { $cond: [{ $eq: ["$type", "credit"] }, 1, 0] },
+          },
         },
       },
       { $sort: { _id: 1 } },
@@ -413,12 +502,16 @@ export const getAdvancedStats = TryCatch(
       date: { $gte: startOfMonth, $lt: endOfMonth },
     }).lean();
 
-    const categoryMap: Record<string, { total: number; count: number }> = {};
-    let monthTotal = 0;
+    const debitExpenses = allMonthExpenses.filter((exp) => exp.type === "debit");
+    const creditExpenses = allMonthExpenses.filter(
+      (exp) => exp.type === "credit",
+    );
 
-    for (const exp of allMonthExpenses) {
-      monthTotal += exp.amount;
-      // Extract category label: use remarks prefix (#Tag) or category field or "Other"
+    const categoryMap: Record<string, { total: number; count: number }> = {};
+    let debitMonthTotal = 0;
+
+    for (const exp of debitExpenses) {
+      debitMonthTotal += exp.amount;
       let label = "Other";
       if (exp.category && exp.category !== "-") {
         label = exp.category;
@@ -441,12 +534,14 @@ export const getAdvancedStats = TryCatch(
         total: Math.round(total * 100) / 100,
         count,
         percentage:
-          monthTotal > 0 ? Math.round((total / monthTotal) * 100 * 10) / 10 : 0,
+          debitMonthTotal > 0
+            ? Math.round((total / debitMonthTotal) * 100 * 10) / 10
+            : 0,
       }))
       .sort((a, b) => b.total - a.total);
 
     // ── 4. Top 5 Expenses for selected month ──
-    const top5 = [...allMonthExpenses]
+    const top5 = [...debitExpenses]
       .sort((a, b) => b.amount - a.amount)
       .slice(0, 5)
       .map((e) => ({
@@ -458,31 +553,56 @@ export const getAdvancedStats = TryCatch(
       }));
 
     // ── 5. Summary for selected month ──
+    const totalDebits = debitExpenses.reduce((sum, exp) => sum + exp.amount, 0);
+    const totalCredits = creditExpenses.reduce(
+      (sum, exp) => sum + exp.amount,
+      0,
+    );
+    const net = totalCredits - totalDebits;
     const daysInMonth = new Date(year, month, 0).getDate();
     const activeDays = dailyBreakdown.length;
-    const avgDailySpend = activeDays > 0 ? monthTotal / daysInMonth : 0;
+    const avgDailyDebit = totalDebits > 0 ? totalDebits / daysInMonth : 0;
+    const avgDailyCredit = totalCredits > 0 ? totalCredits / daysInMonth : 0;
 
     return res.status(200).json({
       success: true,
       data: {
+        selectedLedger: selectedLedger
+          ? {
+              _id: selectedLedger._id.toString(),
+              year: selectedLedger.year,
+              month: selectedLedger.month,
+              status: selectedLedger.status,
+            }
+          : null,
         selectedMonth: { year, month },
         summary: {
-          total: Math.round(monthTotal * 100) / 100,
-          count: allMonthExpenses.length,
-          avgDailySpend: Math.round(avgDailySpend * 100) / 100,
+          totalDebits: Math.round(totalDebits * 100) / 100,
+          totalCredits: Math.round(totalCredits * 100) / 100,
+          net: Math.round(net * 100) / 100,
+          debitCount: debitExpenses.length,
+          creditCount: creditExpenses.length,
+          avgDailyDebit: Math.round(avgDailyDebit * 100) / 100,
+          avgDailyCredit: Math.round(avgDailyCredit * 100) / 100,
           activeDays,
         },
         monthlyTrend: monthlyTrend.map((m) => ({
           month: `${m._id.year}-${String(m._id.month).padStart(2, "0")}`,
           year: m._id.year,
           monthNum: m._id.month,
-          total: Math.round(m.total * 100) / 100,
-          count: m.count,
+          debitTotal: Math.round(m.debitTotal * 100) / 100,
+          creditTotal: Math.round(m.creditTotal * 100) / 100,
+          debitCount: m.debitCount,
+          creditCount: m.creditCount,
+          net: Math.round((m.creditTotal - m.debitTotal) * 100) / 100,
         })),
         dailyBreakdown: dailyBreakdown.map((d) => ({
           date: d._id,
-          total: Math.round(d.total * 100) / 100,
-          count: d.count,
+          debitTotal: Math.round(d.debitTotal * 100) / 100,
+          creditTotal: Math.round(d.creditTotal * 100) / 100,
+          debitCount: d.debitCount,
+          creditCount: d.creditCount,
+          net: Math.round((d.creditTotal - d.debitTotal) * 100) / 100,
         })),
         categoryBreakdown,
         top5Expenses: top5,
@@ -602,6 +722,404 @@ export const checkDuplicate = TryCatch(
   },
 );
 
+function buildExpenseExportHtml({
+  ledger,
+  user,
+  debitExpenses,
+  creditExpenses,
+}: {
+  ledger: {
+    year: number;
+    month: number;
+    status: "open" | "closed";
+    totalExpenses: number;
+    totalCredits: number;
+  };
+  user: { name: string; phone?: string; email?: string };
+  debitExpenses: any[];
+  creditExpenses: any[];
+}) {
+  const allExpenses = [...debitExpenses, ...creditExpenses];
+  const net = ledger.totalCredits - ledger.totalExpenses;
+  const conclusionLabel = net >= 0 ? "Surplus" : "Deficit";
+  const conclusionColor = net >= 0 ? "#16A34A" : "#DC2626";
+  const daysInMonth = new Date(ledger.year, ledger.month, 0).getDate();
+  const activeDays = new Set(allExpenses.map((e) => new Date(e.date).toDateString())).size;
+  const avgDailyDebit = ledger.totalExpenses > 0 && daysInMonth > 0 ? ledger.totalExpenses / daysInMonth : 0;
+  const avgDailyCredit = ledger.totalCredits > 0 && daysInMonth > 0 ? ledger.totalCredits / daysInMonth : 0;
+
+  const generatedOn = new Date().toLocaleDateString("en-IN", { year: "numeric", month: "short", day: "numeric" });
+  const periodLabel = new Date(ledger.year, ledger.month - 1, 1).toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+
+  //  Derived analytics ─
+  // 1. Category breakdown from debits
+  const catMap: Record<string, { total: number; count: number }> = {};
+  for (const exp of debitExpenses) {
+    let label = exp.category || "Uncategorized";
+    if (!label && exp.remarks) {
+      const m = exp.remarks.match(/^#\s*(.+)/);
+      if (m) label = m[1].trim();
+    }
+    if (!label) label = "Uncategorized";
+    if (!catMap[label]) catMap[label] = { total: 0, count: 0 };
+    catMap[label].total += exp.amount;
+    catMap[label].count += 1;
+  }
+  const categories = Object.entries(catMap)
+    .map(([name, { total, count }]) => ({
+      name,
+      total: Math.round(total * 100) / 100,
+      count,
+      pct: ledger.totalExpenses > 0 ? Math.round((total / ledger.totalExpenses) * 1000) / 10 : 0,
+    }))
+    .sort((a, b) => b.total - a.total);
+
+  // 2. Daily breakdown
+  const dailyDebit: Record<string, number> = {};
+  const dailyCredit: Record<string, number> = {};
+  for (const exp of debitExpenses) {
+    const d = new Date(exp.date).getDate();
+    dailyDebit[d] = (dailyDebit[d] || 0) + exp.amount;
+  }
+  for (const exp of creditExpenses) {
+    const d = new Date(exp.date).getDate();
+    dailyCredit[d] = (dailyCredit[d] || 0) + exp.amount;
+  }
+  const daysWithData = Array.from(
+    new Set([...Object.keys(dailyDebit), ...Object.keys(dailyCredit)].map(Number))
+  ).sort((a, b) => a - b);
+  const maxDailyAmt = Math.max(
+    ...Object.values(dailyDebit),
+    ...Object.values(dailyCredit),
+    1,
+  );
+
+  // 3. Top 5 expenses
+  const top5 = [...debitExpenses].sort((a, b) => b.amount - a.amount).slice(0, 5);
+
+  // 4. Comparison bars
+  const maxBar = Math.max(ledger.totalCredits, ledger.totalExpenses, 1);
+  const creditBarW = Math.round((ledger.totalCredits / maxBar) * 100);
+  const debitBarW = Math.round((ledger.totalExpenses / maxBar) * 100);
+
+  //  HTML helpers 
+  const catColors = ["#EF4444","#F97316","#EAB308","#8B5CF6","#EC4899","#06B6D4","#10B981","#6366F1"];
+
+  const renderRows = (entries: any[], cls: string) =>
+    entries.length > 0
+      ? entries.map((exp) => `
+        <tr>
+          <td>${new Date(exp.date).toLocaleDateString("en-IN")}</td>
+          <td>${exp.remarks || "-"}</td>
+          <td>${exp.category || "-"}</td>
+          <td class="amount-cell ${cls}">Rs. ${exp.amount.toFixed(2)}</td>
+        </tr>`).join("")
+      : `<tr><td colspan="4" class="empty-row">No transactions in this section.</td></tr>`;
+
+  const renderCategoryRows = () =>
+    categories.length > 0
+      ? categories.map((c, i) => `
+        <tr>
+          <td>
+            <span class="cat-dot" style="background:${catColors[i % catColors.length]};"></span>
+            ${c.name}
+          </td>
+          <td style="text-align:center;">${c.count}</td>
+          <td>
+            <div class="cat-bar-track">
+              <div class="cat-bar-fill" style="width:${c.pct}%;background:${catColors[i % catColors.length]};"></div>
+            </div>
+          </td>
+          <td style="text-align:right;font-weight:700;">${c.pct}%</td>
+          <td class="amount-cell debit-text">Rs. ${c.total.toFixed(2)}</td>
+        </tr>`).join("")
+      : `<tr><td colspan="5" class="empty-row">No category data.</td></tr>`;
+
+  const renderDailyChart = () => {
+    if (daysWithData.length === 0) return `<p class="empty-notice">No daily data available.</p>`;
+    return daysWithData.map((day) => {
+      const d = dailyDebit[day] || 0;
+      const c = dailyCredit[day] || 0;
+      const dW = Math.round((d / maxDailyAmt) * 100);
+      const cW = Math.round((c / maxDailyAmt) * 100);
+      return `
+        <div class="daily-row">
+          <div class="day-label">D${day}</div>
+          <div class="day-bars">
+            ${d > 0 ? `<div class="day-bar-wrap"><div class="day-bar debit-bar" style="width:${dW}%"></div><span class="day-amt debit-text">Rs.${Math.round(d)}</span></div>` : ""}
+            ${c > 0 ? `<div class="day-bar-wrap"><div class="day-bar credit-bar" style="width:${cW}%"></div><span class="day-amt credit-text">Rs.${Math.round(c)}</span></div>` : ""}
+          </div>
+        </div>`;
+    }).join("");
+  };
+
+  const renderTop5 = () =>
+    top5.length > 0
+      ? top5.map((exp, i) => {
+          const pct = ledger.totalExpenses > 0 ? Math.round((exp.amount / ledger.totalExpenses) * 100) : 0;
+          return `
+        <div class="top-item">
+          <div class="top-rank">#${i + 1}</div>
+          <div class="top-info">
+            <div class="top-name">${exp.remarks || exp.category || "Uncategorized"}</div>
+            <div class="top-date">${new Date(exp.date).toLocaleDateString("en-IN")}</div>
+            <div class="top-bar-track"><div class="top-bar-fill" style="width:${pct}%;"></div></div>
+          </div>
+          <div class="top-amount debit-text">Rs. ${exp.amount.toFixed(2)}</div>
+        </div>`;
+        }).join("")
+      : `<p class="empty-notice">No expense transactions this month.</p>`;
+
+  //  Full HTML 
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Finzz Monthly Report - ${periodLabel}</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', Arial, sans-serif; padding: 28px; background: #f1f5f9; color: #0f172a; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .container { max-width: 900px; margin: 0 auto; background: #ffffff; border-radius: 20px; padding: 32px; box-shadow: 0 16px 48px rgba(15,23,42,0.10); }
+
+    /* Header */
+    .header { display: flex; justify-content: space-between; align-items: flex-start; padding-bottom: 20px; border-bottom: 3px solid #4F46E5; margin-bottom: 28px; gap: 20px; }
+    .logo { font-size: 32px; font-weight: 900; color: #4F46E5; font-style: italic; letter-spacing: -1.5px; }
+    .subtitle { margin-top: 8px; color: #475569; font-size: 13px; line-height: 1.7; }
+    .user-details { text-align: right; color: #475569; font-size: 13px; line-height: 1.8; }
+    .user-details strong { color: #0f172a; font-size: 15px; display: block; margin-bottom: 2px; }
+
+    /* Summary cards */
+    .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 28px; }
+    .summary-card { border-radius: 16px; padding: 16px; border: 1px solid #e2e8f0; }
+    .summary-card .s-icon { width: 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-bottom: 10px; font-size: 18px; }
+    .summary-card .s-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: #64748b; font-weight: 700; margin-bottom: 4px; }
+    .summary-card .s-value { font-size: 20px; font-weight: 900; margin-bottom: 2px; }
+    .summary-card .s-sub { font-size: 11px; color: #94a3b8; }
+    .card-debit { background: #FEF2F2; border-color: #FECACA; }
+    .card-credit { background: #F0FDF4; border-color: #BBF7D0; }
+    .card-net { border-color: #e2e8f0; }
+    .card-avg { background: #EEF2FF; border-color: #C7D2FE; }
+
+    /* Section headings */
+    .section-title { font-size: 17px; font-weight: 800; margin: 28px 0 12px; color: #0f172a; display: flex; align-items: center; gap: 8px; }
+    .section-title::after { content: ""; flex: 1; height: 2px; background: #e2e8f0; border-radius: 1px; }
+    .section-badge { background: #4F46E5; color: #fff; font-size: 10px; padding: 2px 8px; border-radius: 999px; font-weight: 700; letter-spacing: 0.4px; vertical-align: middle; }
+
+    /* Comparison horizontal bars */
+    .compare-section { margin-bottom: 28px; }
+    .bar-row { margin-bottom: 14px; }
+    .bar-header { display: flex; justify-content: space-between; font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+    .bar-track { width: 100%; height: 20px; border-radius: 999px; background: #f1f5f9; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 999px; }
+
+    /* Category table */
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { padding: 11px 12px; text-align: left; border-bottom: 1px solid #f1f5f9; font-size: 13px; }
+    th { background: #4F46E5; color: #fff; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700; }
+    tr:last-child td { border-bottom: none; }
+    tr:nth-child(even) td { background: #f8fafc; }
+    .total-row td { font-weight: 800 !important; background: #f1f5f9 !important; border-top: 2px solid #e2e8f0; }
+    .amount-cell { text-align: right; font-weight: 700; }
+    .credit-text { color: #16A34A; }
+    .debit-text { color: #DC2626; }
+    .empty-row { text-align: center; color: #94a3b8; font-style: italic; padding: 24px; }
+    .empty-notice { color: #94a3b8; font-style: italic; font-size: 13px; margin: 10px 0; }
+    .cat-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 7px; vertical-align: middle; }
+    .cat-bar-track { width: 100%; height: 10px; border-radius: 999px; background: #f1f5f9; overflow: hidden; }
+    .cat-bar-fill { height: 100%; border-radius: 999px; }
+
+    /* Daily chart */
+    .daily-chart { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+    .daily-row { display: flex; align-items: flex-start; gap: 10px; }
+    .day-label { font-size: 11px; color: #64748b; font-weight: 700; width: 26px; padding-top: 3px; flex-shrink: 0; }
+    .day-bars { flex: 1; display: flex; flex-direction: column; gap: 3px; }
+    .day-bar-wrap { display: flex; align-items: center; gap: 8px; }
+    .day-bar { height: 14px; border-radius: 999px; min-width: 4px; }
+    .debit-bar { background: linear-gradient(90deg, #EF4444, #F87171); }
+    .credit-bar { background: linear-gradient(90deg, #22C55E, #4ADE80); }
+    .day-amt { font-size: 10px; font-weight: 700; white-space: nowrap; }
+
+    /* Top 5 */
+    .top-list { display: flex; flex-direction: column; gap: 14px; margin-top: 8px; }
+    .top-item { display: flex; align-items: center; gap: 12px; }
+    .top-rank { width: 26px; height: 26px; border-radius: 8px; background: #4F46E5; color: #fff; font-size: 12px; font-weight: 800; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    .top-info { flex: 1; }
+    .top-name { font-size: 13px; font-weight: 700; color: #0f172a; margin-bottom: 2px; }
+    .top-date { font-size: 11px; color: #94a3b8; margin-bottom: 5px; }
+    .top-bar-track { height: 8px; background: #f1f5f9; border-radius: 999px; overflow: hidden; }
+    .top-bar-fill { height: 100%; background: linear-gradient(90deg, #EF4444, #F97316); border-radius: 999px; }
+    .top-amount { font-size: 15px; font-weight: 800; flex-shrink: 0; }
+
+    /* Conclusion */
+    .conclusion { margin-top: 28px; padding: 20px; border-radius: 18px; background: #f8fafc; border: 1px solid #e2e8f0; }
+    .conclusion-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px; font-weight: 800; color: #64748b; margin-bottom: 14px; }
+    .conclusion-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: #475569; }
+    .conclusion-row strong { color: #0f172a; }
+    .conclusion-final { margin-top: 14px; padding-top: 14px; border-top: 2px solid #e2e8f0; display: flex; justify-content: space-between; font-size: 22px; font-weight: 900; color: ${conclusionColor}; }
+
+    /* Info chips */
+    .info-chips { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+    .chip { background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 999px; padding: 6px 14px; font-size: 12px; color: #475569; }
+    .chip strong { color: #0f172a; }
+
+    /* Footer */
+    .footer { margin-top: 30px; padding-top: 18px; border-top: 1px solid #e2e8f0; color: #94a3b8; font-size: 12px; text-align: center; }
+
+    @media print { body { background: #fff; } .container { box-shadow: none; } }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <div>
+      <div class="logo">Finzz</div>
+      <div class="subtitle">Monthly Financial Report &bull; ${periodLabel}<br>Generated on ${generatedOn}</div>
+    </div>
+    <div class="user-details">
+      <strong>${user.name}</strong>
+      ${user.phone ? `<div>${user.phone}</div>` : ""}
+      ${user.email ? `<div>${user.email}</div>` : ""}
+    </div>
+  </div>
+
+  <!-- Info chips -->
+  <div class="info-chips">
+    <div class="chip">Period: <strong>${periodLabel}</strong></div>
+    <div class="chip">Status: <strong style="text-transform:capitalize">${ledger.status}</strong></div>
+    <div class="chip">Total Transactions: <strong>${allExpenses.length}</strong></div>
+    <div class="chip">Active Days: <strong>${activeDays}</strong></div>
+  </div>
+
+  <!-- Summary cards -->
+  <div class="summary-grid">
+    <div class="summary-card card-debit">
+      <div class="s-icon" style="background:#FEE2E2;"></div>
+      <div class="s-label">Total Debited</div>
+      <div class="s-value debit-text">Rs. ${ledger.totalExpenses.toFixed(2)}</div>
+      <div class="s-sub">${debitExpenses.length} expense${debitExpenses.length !== 1 ? "s" : ""}</div>
+    </div>
+    <div class="summary-card card-credit">
+      <div class="s-icon" style="background:#D1FAE5;"></div>
+      <div class="s-label">Total Credited</div>
+      <div class="s-value credit-text">Rs. ${ledger.totalCredits.toFixed(2)}</div>
+      <div class="s-sub">${creditExpenses.length} credit${creditExpenses.length !== 1 ? "s" : ""}</div>
+    </div>
+    <div class="summary-card card-net">
+      <div class="s-icon" style="background:${net >= 0 ? "#D1FAE5" : "#FEE2E2"}">${net >= 0 ? "" : ""}</div>
+      <div class="s-label">${conclusionLabel}</div>
+      <div class="s-value" style="color:${conclusionColor}">${net >= 0 ? "+" : "-"}Rs. ${Math.abs(net).toFixed(2)}</div>
+      <div class="s-sub">${net >= 0 ? "You saved money" : "Spent more than earned"}</div>
+    </div>
+    <div class="summary-card card-avg">
+      <div class="s-icon" style="background:#E0E7FF;"></div>
+      <div class="s-label">Avg/Day</div>
+      <div class="s-value debit-text">Rs. ${Math.round(avgDailyDebit)}</div>
+      <div class="s-sub">Debit &bull; Rs. ${Math.round(avgDailyCredit)} Credit</div>
+    </div>
+  </div>
+
+  <!-- Debit vs Credit bars -->
+  <div class="section-title">Credit vs Debit Comparison <span class="section-badge">Overview</span></div>
+  <div class="compare-section">
+    <div class="bar-row">
+      <div class="bar-header"><span> Credits (Income)</span><span class="credit-text">Rs. ${ledger.totalCredits.toFixed(2)}</span></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${creditBarW}%;background:linear-gradient(90deg,#22C55E,#4ADE80);"></div></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-header"><span> Debits (Expenses)</span><span class="debit-text">Rs. ${ledger.totalExpenses.toFixed(2)}</span></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${debitBarW}%;background:linear-gradient(90deg,#EF4444,#F87171);"></div></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-header"><span>${conclusionLabel}</span><span style="color:${conclusionColor};">${net >= 0 ? "+" : ""}Rs. ${net.toFixed(2)}</span></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${Math.min(Math.round((Math.abs(net) / maxBar) * 100), 100)}%;background:${conclusionColor};"></div></div>
+    </div>
+  </div>
+
+  <!-- Category breakdown -->
+  <div class="section-title">Category Breakdown <span class="section-badge">Debits</span></div>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:32%">Category</th>
+        <th style="width:10%;text-align:center">Txns</th>
+        <th style="width:30%">Distribution</th>
+        <th style="width:10%;text-align:right">%</th>
+        <th style="width:18%;text-align:right">Amount</th>
+      </tr>
+    </thead>
+    <tbody>${renderCategoryRows()}</tbody>
+  </table>
+
+  <!-- Top 5 expenses -->
+  <div class="section-title">Top Expenses <span class="section-badge">This Month</span></div>
+  <div class="top-list">${renderTop5()}</div>
+
+  <!-- Daily spending chart -->
+  <div class="section-title">Daily Activity <span class="section-badge">${periodLabel}</span></div>
+  <div class="daily-chart">${renderDailyChart()}</div>
+
+  <!-- Expense transactions table -->
+  <div class="section-title">Expense Transactions <span class="section-badge">Debit</span></div>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:18%">Date</th>
+        <th style="width:40%">Remarks</th>
+        <th style="width:20%">Category</th>
+        <th style="width:22%;text-align:right">Amount</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${renderRows(debitExpenses, "debit-text")}
+      <tr class="total-row">
+        <td colspan="3" style="text-align:right">Expense Total</td>
+        <td class="amount-cell debit-text">Rs. ${ledger.totalExpenses.toFixed(2)}</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- Credit transactions table -->
+  <div class="section-title">Credit Transactions <span class="section-badge">Income</span></div>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:18%">Date</th>
+        <th style="width:40%">Remarks</th>
+        <th style="width:20%">Category</th>
+        <th style="width:22%;text-align:right">Amount</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${renderRows(creditExpenses, "credit-text")}
+      <tr class="total-row">
+        <td colspan="3" style="text-align:right">Credit Total</td>
+        <td class="amount-cell credit-text">Rs. ${ledger.totalCredits.toFixed(2)}</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- Conclusion -->
+  <div class="conclusion">
+    <div class="conclusion-title">Financial Summary</div>
+    <div class="conclusion-row"><span>Total Credits (Income)</span><strong class="credit-text">Rs. ${ledger.totalCredits.toFixed(2)}</strong></div>
+    <div class="conclusion-row"><span>Total Debits (Expenses)</span><strong class="debit-text">Rs. ${ledger.totalExpenses.toFixed(2)}</strong></div>
+    <div class="conclusion-row"><span>Active Days</span><strong>${activeDays} of ${daysInMonth}</strong></div>
+    <div class="conclusion-row"><span>Avg Daily Debit</span><strong>Rs. ${Math.round(avgDailyDebit)}</strong></div>
+    <div class="conclusion-final">
+      <span>${conclusionLabel}</span>
+      <span>${net >= 0 ? "+" : "-"}Rs. ${Math.abs(net).toFixed(2)}</span>
+    </div>
+  </div>
+
+  <div class="footer">Generated by Finzz &copy; ${new Date().getFullYear()} &bull; ${periodLabel} Report</div>
+
+</div>
+</body>
+</html>`;
+}
+
 // ==========================================
 // Export PDF (HTML for client-side rendering)
 // ==========================================
@@ -624,12 +1142,13 @@ export const exportPDF = TryCatch(
       return next(new ErrorHandler("Unauthorized", 403));
     }
 
-    // Get all expenses for this ledger
     const expenses = await Expense.find({ ledgerId }).sort({ date: -1 }).lean();
+    const debitExpenses = expenses.filter((expense) => expense.type === "debit");
+    const creditExpenses = expenses.filter((expense) => expense.type === "credit");
 
-    // Get user details from DB
+    // Get user details from DB (uses `phone` field, not `mobile`)
     const userDoc = await User.findById(userId)
-      .select("name mobile email")
+      .select("name phone email")
       .lean();
 
     if (!userDoc) {
@@ -638,194 +1157,22 @@ export const exportPDF = TryCatch(
 
     const user = {
       name: (userDoc as any).name || "User",
-      mobile: (userDoc as any).mobile || "",
+      phone: (userDoc as any).phone || "",
       email: (userDoc as any).email || "",
     };
 
-    // Build HTML string
-    const html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <title>Expense Report - ${ledger.year}-${String(ledger.month).padStart(2, "0")}</title>
-        <style>
-          * { margin: 0; padding: 0; box-sizing: border-box; }
-          body { 
-            font-family: 'Segoe UI', Arial, sans-serif; 
-            padding: 40px; 
-            background: #f9fafb;
-          }
-          .container {
-            max-width: 800px;
-            margin: 0 auto;
-            background: white;
-            padding: 40px;
-            border-radius: 8px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-          }
-          .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            margin-bottom: 30px;
-            padding-bottom: 20px;
-            border-bottom: 3px solid #4F46E5;
-          }
-          .logo {
-            font-size: 32px;
-            font-weight: 900;
-            color: #4F46E5;
-            font-style: italic;
-            letter-spacing: -1px;
-          }
-          .user-details {
-            text-align: right;
-            color: #6B7280;
-            line-height: 1.6;
-          }
-          .user-details strong {
-            color: #1F2937;
-          }
-          .report-title {
-            font-size: 24px;
-            font-weight: 700;
-            color: #1F2937;
-            margin-bottom: 20px;
-          }
-          .report-info {
-            display: flex;
-            gap: 30px;
-            margin-bottom: 30px;
-            padding: 15px;
-            background: #F3F4F6;
-            border-radius: 6px;
-          }
-          .info-item {
-            color: #6B7280;
-          }
-          .info-item strong {
-            color: #1F2937;
-            display: block;
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 4px;
-          }
-          table { 
-            width: 100%; 
-            border-collapse: collapse; 
-            margin-top: 20px;
-          }
-          th, td { 
-            padding: 12px;
-            text-align: left;
-            border-bottom: 1px solid #E5E7EB;
-          }
-          th { 
-            background-color: #4F46E5;
-            color: white;
-            font-weight: 600;
-            text-transform: uppercase;
-            font-size: 11px;
-            letter-spacing: 0.5px;
-          }
-          tr:hover {
-            background-color: #F9FAFB;
-          }
-          .amount-cell {
-            text-align: right;
-            font-weight: 600;
-            color: #EF4444;
-          }
-          .total-row {
-            font-weight: bold;
-            background-color: #F3F4F6;
-            border-top: 2px solid #4F46E5;
-          }
-          .total-row td {
-            padding: 16px 12px;
-            font-size: 16px;
-            color: #1F2937;
-          }
-          .total-row .amount-cell {
-            color: #EF4444;
-            font-size: 18px;
-          }
-          .footer {
-            margin-top: 40px;
-            padding-top: 20px;
-            border-top: 1px solid #E5E7EB;
-            text-align: center;
-            color: #9CA3AF;
-            font-size: 12px;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <div class="header">
-            <div class="logo">Finzz</div>
-            <div class="user-details">
-              <div><strong>${user.name || "User"}</strong></div>
-              ${user.mobile ? `<div>${user.mobile}</div>` : ""}
-              ${user.email ? `<div>${user.email}</div>` : ""}
-            </div>
-          </div>
-          
-          <div class="report-title">Expense Report</div>
-          
-          <div class="report-info">
-            <div class="info-item">
-              <strong>Period</strong>
-              <div>${ledger.year}-${String(ledger.month).padStart(2, "0")}</div>
-            </div>
-            <div class="info-item">
-              <strong>Status</strong>
-              <div style="text-transform: capitalize;">${ledger.status}</div>
-            </div>
-            <div class="info-item">
-              <strong>Generated</strong>
-              <div>${new Date().toLocaleDateString()}</div>
-            </div>
-          </div>
-          
-          <table>
-            <thead>
-              <tr>
-                <th style="width: 15%;">Date</th>
-                <th style="width: 40%;">Remarks</th>
-                <th style="width: 20%;">Category</th>
-                <th style="width: 25%; text-align: right;">Amount (₹)</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${expenses
-                .map(
-                  (exp) => `
-              <tr>
-                <td>${new Date(exp.date).toLocaleDateString()}</td>
-                <td>${exp.remarks || "-"}</td>
-                <td>${exp.category || "-"}</td>
-                <td class="amount-cell">₹${exp.amount.toFixed(2)}</td>
-              </tr>
-            `,
-                )
-                .join("")}
-              <tr class="total-row">
-                <td colspan="3" style="text-align: right; padding-right: 20px;">TOTAL</td>
-                <td class="amount-cell">₹${ledger.totalExpenses.toFixed(2)}</td>
-              </tr>
-            </tbody>
-          </table>
-          
-          <div class="footer">
-            Generated by Finzz &copy; ${new Date().getFullYear()}
-          </div>
-        </div>
-      </body>
-      </html>
-    `;
+    const html = buildExpenseExportHtml({
+      ledger: {
+        year: ledger.year,
+        month: ledger.month,
+        status: ledger.status as "open" | "closed",
+        totalExpenses: ledger.totalExpenses,
+        totalCredits: ledger.totalCredits || 0,
+      },
+      user,
+      debitExpenses: debitExpenses as any[],
+      creditExpenses: creditExpenses as any[],
+    });
 
     return res.status(200).json({
       success: true,

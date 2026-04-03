@@ -16,6 +16,17 @@ export async function sendPushNotification(
   data?: Record<string, unknown>,
 ): Promise<void> {
   try {
+    const notificationRecord = {
+      recipient: userId,
+      sender: data?.senderId,
+      type: data?.type,
+      title,
+      body,
+      data,
+    };
+
+    await Notification.create(notificationRecord);
+
     // 1. Find user and get their push token
     const user = await User.findById(userId)
       .select("pushToken")
@@ -56,14 +67,6 @@ export async function sendPushNotification(
       }
     }
 
-    // 5. Save notification record to database
-    await Notification.create({
-      recipient: userId,
-      sender: data?.senderId,
-      type: data?.type,
-      data,
-    });
-
     console.log(`Push notification sent to user ${userId}`);
   } catch (error) {
     console.error("Error in sendPushNotification:", error);
@@ -94,7 +97,14 @@ export async function sendBulkPushNotifications(
 
     // Build messages
     const messages: ExpoPushMessage[] = [];
-    const notificationRecords = [];
+    const notificationRecords = notifications.map((notification) => ({
+      recipient: notification.userId,
+      sender: notification.data?.senderId,
+      type: notification.data?.type,
+      title: notification.title,
+      body: notification.body,
+      data: notification.data,
+    }));
 
     for (const notification of notifications) {
       const pushToken = userTokenMap.get(notification.userId);
@@ -107,14 +117,11 @@ export async function sendBulkPushNotifications(
           body: notification.body,
           data: notification.data || {},
         });
-
-        notificationRecords.push({
-          recipient: notification.userId,
-          sender: notification.data?.senderId,
-          type: notification.data?.type,
-          data: notification.data,
-        });
       }
+    }
+
+    if (notificationRecords.length > 0) {
+      await Notification.insertMany(notificationRecords);
     }
 
     // Send in chunks
@@ -125,11 +132,6 @@ export async function sendBulkPushNotifications(
       } catch (error) {
         console.error("Error sending bulk push notifications:", error);
       }
-    }
-
-    // Save all notification records
-    if (notificationRecords.length > 0) {
-      await Notification.insertMany(notificationRecords);
     }
 
     console.log(`Bulk push notifications sent to ${messages.length} users`);

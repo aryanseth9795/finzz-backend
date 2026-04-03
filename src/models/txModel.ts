@@ -1,5 +1,7 @@
 import mongoose, { Document, Schema } from "mongoose";
 
+export type TxStatus = "pending" | "verified" | "rejected";
+
 export interface ITx extends Document {
   chatId: mongoose.Types.ObjectId;
   amount: number;
@@ -8,9 +10,13 @@ export interface ITx extends Document {
   to: mongoose.Types.ObjectId;
   from: mongoose.Types.ObjectId;
   addedBy: mongoose.Types.ObjectId;
+  status: TxStatus;
   verified: boolean;
   verifiedBy?: mongoose.Types.ObjectId;
   verifiedAt?: Date;
+  rejectedBy?: mongoose.Types.ObjectId;
+  rejectedAt?: Date;
+  rejectionRemark?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -55,6 +61,12 @@ const txSchema = new Schema<ITx>(
       required: true,
       index: true,
     },
+    status: {
+      type: String,
+      enum: ["pending", "verified", "rejected"],
+      default: "pending",
+      index: true,
+    },
     verified: {
       type: Boolean,
       default: false,
@@ -67,6 +79,17 @@ const txSchema = new Schema<ITx>(
     verifiedAt: {
       type: Date,
     },
+    rejectedBy: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+    },
+    rejectedAt: {
+      type: Date,
+    },
+    rejectionRemark: {
+      type: String,
+      trim: true,
+    },
   },
   {
     timestamps: true,
@@ -74,10 +97,30 @@ const txSchema = new Schema<ITx>(
   },
 );
 
+txSchema.pre("save", function (this: ITx, next) {
+  const nextStatus = this.status || (this.verified ? "verified" : "pending");
+
+  this.status = nextStatus;
+  this.verified = nextStatus === "verified";
+
+  if (nextStatus !== "verified") {
+    this.verifiedBy = undefined;
+    this.verifiedAt = undefined;
+  }
+
+  if (nextStatus !== "rejected") {
+    this.rejectedBy = undefined;
+    this.rejectedAt = undefined;
+    this.rejectionRemark = undefined;
+  }
+
+  next();
+});
+
 // Compound indexes for scalable performance
 txSchema.index({ chatId: 1, date: -1 }); // For pagination in chat view (most important)
-txSchema.index({ chatId: 1, verified: 1 }); // For filtering unverified txns
-txSchema.index({ addedBy: 1, verified: 1 }); // For edit/delete guards
+txSchema.index({ chatId: 1, status: 1 }); // For filtering by lifecycle state
+txSchema.index({ addedBy: 1, status: 1 }); // For edit/delete guards
 txSchema.index({ from: 1, to: 1, date: -1 }); // For per-friend reports
 
 export const Tx = mongoose.models.Tx || mongoose.model<ITx>("Tx", txSchema);

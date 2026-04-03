@@ -8,10 +8,15 @@ export interface INotification extends Document {
     | "friend_accepted"
     | "txn_added"
     | "txn_verified"
+    | "txn_rejected"
+    | "txn_reworked"
+    | "txn_deleted"
     | "pool_tx_added"
     | "pool_tx_verified"
     | "pool_member_added"
     | "pool_member_removed";
+  title?: string;
+  body?: string;
   data?: Record<string, any>;
   read: boolean;
   createdAt: Date;
@@ -38,12 +43,23 @@ const notificationSchema = new Schema<INotification>(
         "friend_accepted",
         "txn_added",
         "txn_verified",
+        "txn_rejected",
+        "txn_reworked",
+        "txn_deleted",
         "pool_tx_added",
         "pool_tx_verified",
         "pool_member_added",
         "pool_member_removed",
       ],
       required: true,
+    },
+    title: {
+      type: String,
+      trim: true,
+    },
+    body: {
+      type: String,
+      trim: true,
     },
     data: {
       type: Schema.Types.Mixed,
