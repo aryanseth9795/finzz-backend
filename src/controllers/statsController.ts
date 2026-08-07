@@ -6,6 +6,8 @@ import { Chat } from "../models/chatModel.js";
 import { User } from "../models/userModel.js";
 import { getCarryForward } from "../services/summaryService.js";
 import ErrorHandler from "../middlewares/Errorhandler.js";
+import { assertChatMember } from "../utils/authorize.js";
+import { escapeHtml, formatCurrency } from "../utils/html.js";
 import mongoose from "mongoose";
 
 /**
@@ -16,6 +18,12 @@ import mongoose from "mongoose";
 export const getChatStats = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { chatId } = req.params;
+
+    // Authorisation. Without this, any signed-in user could read any other
+    // pair's balances by supplying an arbitrary chat id — the endpoint checked
+    // that you were logged in, never that the chat was yours.
+    await assertChatMember(chatId, req.user.id);
+
     const now = new Date();
     const year = parseInt(req.query.year as string) || now.getFullYear();
     const month = parseInt(req.query.month as string) || now.getMonth() + 1;
@@ -98,6 +106,10 @@ export const getChatStats = TryCatch(
 export const getChatMonths = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { chatId } = req.params;
+
+    // Same IDOR as getChatStats: this leaked which months a chat had activity
+    // in, and therefore the existence and shape of other people's ledgers.
+    await assertChatMember(chatId, req.user.id);
 
     const months = await MonthlySummary.find({
       chatId,
@@ -266,20 +278,35 @@ export const exportChatLedger = TryCatch(
     const year = parseInt(req.query.year as string) || now.getFullYear();
     const month = parseInt(req.query.month as string) || now.getMonth() + 1;
 
+    // Membership first, via the shared helper, so all three chat endpoints
+    // answer identically. This handler previously rolled its own check and
+    // returned 403 — which confirms the chat exists, and so leaks exactly the
+    // information the 404 in assertChatMember is chosen to withhold.
+    await assertChatMember(chatId, userId);
+
     const chat = await Chat.findById(chatId)
       .select("members")
       .populate("members", "name phone avatar")
       .lean<{ members: { _id: any; name: string; phone?: string }[] }>();
 
     if (!chat) return next(new ErrorHandler("Chat not found", 404));
-    if (!chat.members.some((m) => m._id.toString() === userId)) {
-      return next(new ErrorHandler("You are not a member of this chat", 403));
-    }
 
     const me = chat.members.find((m) => m._id.toString() === userId);
     const friend = chat.members.find((m) => m._id.toString() !== userId);
-    const myName = me?.name || "You";
-    const friendName = friend?.name || "Friend";
+
+    /**
+     * Escaped at the point of derivation, so every downstream interpolation in
+     * the report template is safe without auditing each one individually.
+     *
+     * These values are attacker-controlled: a counterparty chooses their own
+     * display name, and the resulting HTML is rendered by expo-print inside a
+     * WebView on YOUR device when you export a statement. Unescaped, a name of
+     * `<img src=x onerror=...>` executed in your app's context.
+     */
+    const myName = escapeHtml(me?.name || "You");
+    const friendName = escapeHtml(friend?.name || "Friend");
+    const myPhone = escapeHtml(me?.phone ?? "");
+    const friendPhone = escapeHtml(friend?.phone ?? "");
 
     const monthStart = new Date(year, month - 1, 1);
     const monthEnd = new Date(year, month, 0, 23, 59, 59, 999);
@@ -334,7 +361,7 @@ export const exportChatLedger = TryCatch(
 
     const renderRows = (entries: typeof txns, cls: string) =>
       entries.length > 0
-        ? entries.map((tx) => `<tr><td>${new Date(tx.date).toLocaleDateString("en-IN")}</td><td>${tx.remarks || "-"}</td><td style="text-align:center">${tx.status === "verified" ? "✓" : "⏳"}</td><td class="amount-cell ${cls}">₹${tx.amount.toLocaleString("en-IN")}</td></tr>`).join("")
+        ? entries.map((tx) => `<tr><td>${new Date(tx.date).toLocaleDateString("en-IN")}</td><td>${escapeHtml(tx.remarks || "-")}</td><td style="text-align:center">${tx.status === "verified" ? "✓" : "⏳"}</td><td class="amount-cell ${cls}">${formatCurrency(tx.amount)}</td></tr>`).join("")
         : `<tr><td colspan="4" class="empty-row">No transactions.</td></tr>`;
 
     const renderDailyChart = () => {
@@ -362,7 +389,7 @@ export const exportChatLedger = TryCatch(
 
     const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Finzz Ledger - ${myName} &amp; ${friendName} - ${periodLabel}</title>
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',Arial,sans-serif;padding:28px;background:#f1f5f9;color:#0f172a;-webkit-print-color-adjust:exact;print-color-adjust:exact}.container{max-width:900px;margin:0 auto;background:#fff;border-radius:20px;padding:32px;box-shadow:0 16px 48px rgba(15,23,42,.10)}.header{display:flex;justify-content:space-between;align-items:flex-start;padding-bottom:20px;border-bottom:3px solid #4F46E5;margin-bottom:28px;gap:20px}.logo{font-size:32px;font-weight:900;color:#4F46E5;font-style:italic;letter-spacing:-1.5px}.subtitle{margin-top:8px;color:#475569;font-size:13px;line-height:1.7}.user-details{text-align:right;color:#475569;font-size:13px;line-height:1.8}.user-details strong{color:#0f172a;font-size:15px;display:block}.info-chips{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}.chip{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:999px;padding:6px 14px;font-size:12px;color:#475569}.chip strong{color:#0f172a}.summary-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:28px}.summary-card{border-radius:16px;padding:16px;border:1px solid #e2e8f0}.s-icon{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;font-size:18px}.s-label{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:#64748b;font-weight:700;margin-bottom:4px}.s-value{font-size:20px;font-weight:900;margin-bottom:2px}.s-sub{font-size:11px;color:#94a3b8}.card-sent{background:#FEF2F2;border-color:#FECACA}.card-recv{background:#F0FDF4;border-color:#BBF7D0}.card-net{border-color:#e2e8f0}.card-avg{background:#EEF2FF;border-color:#C7D2FE}.section-title{font-size:17px;font-weight:800;margin:28px 0 12px;color:#0f172a;display:flex;align-items:center;gap:8px}.section-title::after{content:"";flex:1;height:2px;background:#e2e8f0;border-radius:1px}.section-badge{background:#4F46E5;color:#fff;font-size:10px;padding:2px 8px;border-radius:999px;font-weight:700}.compare-section{margin-bottom:28px}.bar-row{margin-bottom:14px}.bar-header{display:flex;justify-content:space-between;font-size:13px;font-weight:700;margin-bottom:6px}.bar-track{width:100%;height:20px;border-radius:999px;background:#f1f5f9;overflow:hidden}.bar-fill{height:100%;border-radius:999px}table{width:100%;border-collapse:collapse;margin-top:8px}th,td{padding:11px 12px;text-align:left;border-bottom:1px solid #f1f5f9;font-size:13px}th{background:#4F46E5;color:#fff;font-size:11px;text-transform:uppercase;letter-spacing:.5px;font-weight:700}tr:last-child td{border-bottom:none}tr:nth-child(even) td{background:#f8fafc}.total-row td{font-weight:800!important;background:#f1f5f9!important;border-top:2px solid #e2e8f0}.amount-cell{text-align:right;font-weight:700}.credit-text{color:#16A34A}.debit-text{color:#DC2626}.empty-row{text-align:center;color:#94a3b8;font-style:italic;padding:24px}.conclusion{margin-top:28px;padding:20px;border-radius:18px;background:#f8fafc;border:1px solid #e2e8f0}.conclusion-title{font-size:11px;text-transform:uppercase;letter-spacing:.8px;font-weight:800;color:#64748b;margin-bottom:14px}.conclusion-row{display:flex;justify-content:space-between;margin-bottom:8px;font-size:14px;color:#475569}.conclusion-row strong{color:#0f172a}.conclusion-final{margin-top:14px;padding-top:14px;border-top:2px solid #e2e8f0;display:flex;justify-content:space-between;font-size:22px;font-weight:900;color:${netColor}}.footer{margin-top:30px;padding-top:18px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:12px;text-align:center}@media print{body{background:#fff}.container{box-shadow:none}}</style></head><body><div class="container">
-<div class="header"><div><div class="logo">Finzz</div><div class="subtitle">Ledger Report &bull; ${myName} &#8596; ${friendName}<br>Period: ${periodLabel} &bull; Generated on ${generatedOn}</div></div><div class="user-details"><strong>${myName}</strong>${me?.phone ? `<div>${me.phone}</div>` : ""}<div style="margin-top:6px"><strong>${friendName}</strong></div>${friend?.phone ? `<div>${friend.phone}</div>` : ""}</div></div>
+<div class="header"><div><div class="logo">Finzz</div><div class="subtitle">Ledger Report &bull; ${myName} &#8596; ${friendName}<br>Period: ${periodLabel} &bull; Generated on ${generatedOn}</div></div><div class="user-details"><strong>${myName}</strong>${myPhone ? `<div>${myPhone}</div>` : ""}<div style="margin-top:6px"><strong>${friendName}</strong></div>${friendPhone ? `<div>${friendPhone}</div>` : ""}</div></div>
 <div class="info-chips"><div class="chip">Period: <strong>${periodLabel}</strong></div><div class="chip">Transactions: <strong>${txns.length}</strong></div><div class="chip">Active Days: <strong>${activeDays}</strong></div><div class="chip">Days in Month: <strong>${daysInMonth}</strong></div></div>
 <div class="summary-grid"><div class="summary-card card-sent"><div class="s-icon" style="background:#FEE2E2">&#128184;</div><div class="s-label">You Sent</div><div class="s-value debit-text">&#8377;${totalSent.toLocaleString("en-IN")}</div><div class="s-sub">${sentTxns.length} txn${sentTxns.length !== 1 ? "s" : ""}</div></div><div class="summary-card card-recv"><div class="s-icon" style="background:#D1FAE5">&#128176;</div><div class="s-label">You Received</div><div class="s-value credit-text">&#8377;${totalReceived.toLocaleString("en-IN")}</div><div class="s-sub">${receivedTxns.length} txn${receivedTxns.length !== 1 ? "s" : ""}</div></div><div class="summary-card card-net"><div class="s-icon" style="background:${net >= 0 ? "#D1FAE5" : "#FEE2E2"}">${net >= 0 ? "&#128200;" : "&#128201;"}</div><div class="s-label">This Month</div><div class="s-value" style="color:${net >= 0 ? "#16A34A" : "#DC2626"}">${net >= 0 ? "+" : ""}&#8377;${net.toLocaleString("en-IN")}</div><div class="s-sub">${net >= 0 ? "Received more" : "Sent more"}</div></div><div class="summary-card card-avg"><div class="s-icon" style="background:#E0E7FF">&#128202;</div><div class="s-label">Overall</div><div class="s-value" style="color:${netColor}">${overallNet >= 0 ? "+" : ""}&#8377;${Math.abs(overallNet).toLocaleString("en-IN")}</div><div class="s-sub">${netLabel} (incl. carry-forward)</div></div></div>
 <div class="section-title">Sent vs Received <span class="section-badge">Comparison</span></div><div class="compare-section"><div class="bar-row"><div class="bar-header"><span>&#128184; You Sent</span><span class="debit-text">&#8377;${totalSent.toLocaleString("en-IN")}</span></div><div class="bar-track"><div class="bar-fill" style="width:${sentBarW}%;background:linear-gradient(90deg,#EF4444,#F87171)"></div></div></div><div class="bar-row"><div class="bar-header"><span>&#128176; You Received</span><span class="credit-text">&#8377;${totalReceived.toLocaleString("en-IN")}</span></div><div class="bar-track"><div class="bar-fill" style="width:${recvBarW}%;background:linear-gradient(90deg,#22C55E,#4ADE80)"></div></div></div></div>

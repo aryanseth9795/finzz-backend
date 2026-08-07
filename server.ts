@@ -1,74 +1,104 @@
-import express from "express";
-import cookieParser from "cookie-parser";
-import cors from "cors";
-import dotenv from "dotenv";
+import mongoose from "mongoose";
 import axios from "axios";
-// Routes
-import userRoutes from "./src/routes/userRoutes.js";
-import txRoutes from "./src/routes/txnRoutes.js";
-import friendRoutes from "./src/routes/friendRoutes.js";
-import chatRoutes from "./src/routes/chatRoutes.js";
-import statsRoutes from "./src/routes/statsRoutes.js";
-import poolRoutes from "./src/routes/poolRoutes.js";
-import expenseRoutes from "./src/routes/expenseRoutes.js";
-import adminRoutes from "./src/routes/adminRoutes.js";
-import notificationRoutes from "./src/routes/notificationRoutes.js";
-import { MongoURL } from "./src/config/envVariables.js";
 
-// Middleware
-import errorMiddleware from "./src/middlewares/error.js";
-
-// DB
+import app from "./src/app.js";
+import {
+  MongoURL,
+  PORT,
+  API_URL,
+  isProduction,
+} from "./src/config/envVariables.js";
 import connectDb from "./src/db/db.js";
 
-// Connect to MongoDB
+/**
+ * Process bootstrap. The Express application itself lives in `src/app.ts` and
+ * is free of side effects, so it can be mounted by tests without opening a
+ * database connection or binding a port.
+ */
 
-connectDb(MongoURL);
+/**
+ * Keep-alive ping for free-tier hosts that idle out.
+ *
+ * Three defects in the previous version: the promise had no `.catch()`, so a
+ * rejection became an unhandled rejection — fatal on Node 15+; `API_URL` was
+ * never defined in .env, so the request went to the literal string
+ * "undefined/health" and rejected every twelve minutes; and the interval was
+ * never cleared on shutdown.
+ */
+let pingTimer: NodeJS.Timeout | undefined;
 
-const app = express();
+const startKeepAlive = () => {
+  if (!API_URL) {
+    console.warn("[keep-alive] API_URL not set — self-ping disabled.");
+    return;
+  }
+  pingTimer = setInterval(
+    () => {
+      axios
+        .get(`${API_URL.replace(/\/$/, "")}/health`, { timeout: 10_000 })
+        .catch((error) =>
+          console.warn("[keep-alive] ping failed:", error.message),
+        );
+    },
+    12 * 60 * 1000,
+  );
+  // Do not let the ping hold the event loop open during shutdown.
+  pingTimer.unref();
+};
 
-// Middleware
-app.use(
-  cors({
-    origin: ["https://finzzadmin.netlify.app", "http://localhost:5173"],
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  }),
-);
-app.use(express.json());
-app.use(cookieParser());
-app.use(express.urlencoded({ extended: true }));
+const start = async () => {
+  // Previously `connectDb(...)` was called without `await`, so the server began
+  // accepting requests before the database was reachable — early requests
+  // failed with confusing errors instead of the process failing loudly.
+  await connectDb(MongoURL);
 
-// Health check
-app.get("/health", (req, res) => {
-  res.send("Welcome to the Finzz Backend API");
-});
-
-// API Routes
-app.use("/api/v1/users", userRoutes);
-app.use("/api/v1/txns", txRoutes);
-app.use("/api/v1/friends", friendRoutes); // Friend system with contact sync
-app.use("/api/v1/chats", chatRoutes); // WhatsApp-style chat list
-app.use("/api/v1/stats", statsRoutes); // Transaction statistics
-app.use("/api/v1/pools", poolRoutes); // Pool management
-app.use("/api/v1/expenses", expenseRoutes); // Daily expense tracker
-app.use("/api/v1/admin", adminRoutes); // Admin panel
-app.use("/api/v1/notifications", notificationRoutes); // User notification feed
-
-// Error handling middleware (must be last)
-app.use(errorMiddleware);
-
-function ping() {
-  axios.get(process.env.API_URL + "/health").then((res) => {
-    console.log(res.data);
+  const server = app.listen(PORT, () => {
+    console.log(
+      `Server listening on port ${PORT} (${isProduction ? "production" : "development"})`,
+    );
+    startKeepAlive();
   });
-}
 
-setInterval(ping, 720000);
+  /**
+   * Graceful shutdown. Without this, a deploy or scale-down kills the process
+   * mid-request and mid-transaction; in-flight writes are lost and sockets are
+   * reset rather than closed.
+   */
+  const shutdown = async (signal: string) => {
+    console.log(`[shutdown] ${signal} received, closing gracefully…`);
+    if (pingTimer) clearInterval(pingTimer);
 
-app.listen(3000, () => {
-  console.log("Server is running on port 3000");
+    server.close(async () => {
+      try {
+        await mongoose.connection.close(false);
+      } catch (error) {
+        console.error("[shutdown] error closing MongoDB:", error);
+      }
+      process.exit(0);
+    });
+
+    // Backstop: never hang forever waiting for a stuck connection.
+    setTimeout(() => {
+      console.error("[shutdown] forced exit after timeout");
+      process.exit(1);
+    }, 15_000).unref();
+  };
+
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+
+  process.on("unhandledRejection", (reason) => {
+    console.error("[fatal] unhandled promise rejection:", reason);
+  });
+  process.on("uncaughtException", (error) => {
+    console.error("[fatal] uncaught exception:", error);
+    process.exit(1);
+  });
+};
+
+start().catch((error) => {
+  console.error("[fatal] failed to start server:", error);
+  process.exit(1);
 });
 
 export default app;

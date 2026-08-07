@@ -8,6 +8,8 @@ import {
   sendPushNotification,
   sendBulkPushNotifications,
 } from "../services/notificationService.js";
+import { decodeCursor, cursorFilter, encodeCursor } from "../utils/cursor.js";
+import { monthRangeUtc, parseTzOffset } from "../utils/dates.js";
 import mongoose from "mongoose";
 
 // ========================
@@ -508,6 +510,7 @@ export const getPoolTxns = TryCatch(
       ? parseInt(req.query.month as string)
       : undefined;
     const userId = req.user.id;
+    const tzOffset = parseTzOffset(req.query.tzOffsetMinutes);
 
     // Verify membership
     const pool = await Pool.findById(poolId);
@@ -526,19 +529,30 @@ export const getPoolTxns = TryCatch(
     // Build query
     const query: any = { poolId };
 
-    if (cursor) {
-      query.date = { $lt: new Date(cursor) };
+    /**
+     * Month range in the user's calendar frame, and a half-open interval.
+     *
+     * The previous `new Date(year, month, 0, 23, 59, 59)` end bound had two
+     * defects: it used server-local time, and `23:59:59` excludes the final
+     * 999 milliseconds of the day — a transaction stamped at 23:59:59.500 on
+     * the last of the month silently vanished from that month's list.
+     */
+    if (year !== undefined && month !== undefined) {
+      const { start, end } = monthRangeUtc(year, month, tzOffset);
+      query.date = { $gte: start, $lt: end };
     }
 
-    if (year !== undefined && month !== undefined) {
-      const startDate = new Date(year, month - 1, 1);
-      const endDate = new Date(year, month, 0, 23, 59, 59);
-      query.date = { ...query.date, $gte: startDate, $lte: endDate };
-    }
+    // Compound keyset cursor, kept separate from the range filter so the two
+    // cannot overwrite each other's `date` constraint (they previously did).
+    const pageFilter = cursorFilter(decodeCursor(cursor));
+    const finalQuery =
+      Object.keys(pageFilter).length > 0 ? { $and: [query, pageFilter] } : query;
 
     // Fetch with pagination
-    const poolTxns = await PoolTx.find(query)
-      .sort({ date: -1 })
+    const poolTxns = await PoolTx.find(finalQuery)
+      // `_id` added to the sort: without it the tie-break in the cursor has no
+      // stable ordering to reference, and same-day rows were dropped.
+      .sort({ date: -1, _id: -1 })
       .limit(limit + 1)
       .populate("addedBy", "name avatar")
       .populate("verifiedBy", "name avatar")
@@ -547,10 +561,9 @@ export const getPoolTxns = TryCatch(
     const hasMore = poolTxns.length > limit;
     if (hasMore) poolTxns.pop();
 
+    const last = poolTxns[poolTxns.length - 1];
     const nextCursor =
-      hasMore && poolTxns.length > 0
-        ? poolTxns[poolTxns.length - 1].date.toISOString()
-        : null;
+      hasMore && last ? encodeCursor(last.date, last._id) : null;
 
     return res.status(200).json({
       success: true,
@@ -781,16 +794,48 @@ export const getPoolStats = TryCatch(
       return next(new ErrorHandler("Access denied", 403));
     }
 
-    // Aggregate statistics
-    const transactions = await PoolTx.find({ poolId }).lean();
+    /**
+     * Aggregate in the database instead of in Node.
+     *
+     * Before: every transaction in the pool was loaded with `PoolTx.find()`,
+     * then the member loop re-filtered that whole array once per member —
+     * O(members × transactions) in application memory, on top of transferring
+     * the entire collection over the wire for a handful of totals.
+     *
+     * One `$group` on the compound key does the same work over the existing
+     * `{ poolId: 1, type: 1 }` index and returns at most (members × 2) rows.
+     */
+    const grouped = await PoolTx.aggregate<{
+      _id: { addedBy: mongoose.Types.ObjectId; type: "credit" | "debit" };
+      total: number;
+    }>([
+      { $match: { poolId: new mongoose.Types.ObjectId(poolId) } },
+      {
+        $group: {
+          _id: { addedBy: "$addedBy", type: "$type" },
+          total: { $sum: "$amount" },
+        },
+      },
+    ]);
 
-    const totalCredited = transactions
-      .filter((tx) => tx.type === "credit")
-      .reduce((sum, tx) => sum + tx.amount, 0);
+    // Index the aggregate result once, then read it per member in O(1) rather
+    // than rescanning the transaction list for each one.
+    const byMember = new Map<string, { credited: number; debited: number }>();
+    let totalCredited = 0;
+    let totalDebited = 0;
 
-    const totalDebited = transactions
-      .filter((tx) => tx.type === "debit")
-      .reduce((sum, tx) => sum + tx.amount, 0);
+    for (const row of grouped) {
+      const memberId = String(row._id.addedBy);
+      const entry = byMember.get(memberId) ?? { credited: 0, debited: 0 };
+      if (row._id.type === "credit") {
+        entry.credited += row.total;
+        totalCredited += row.total;
+      } else {
+        entry.debited += row.total;
+        totalDebited += row.total;
+      }
+      byMember.set(memberId, entry);
+    }
 
     const netBalance = totalCredited - totalDebited;
 
@@ -802,29 +847,19 @@ export const getPoolStats = TryCatch(
     );
 
     // Per-member breakdown
-    const memberBreakdown: any[] = [];
-
-    for (const member of (pool as any).members as any[]) {
-      const memberTxns = transactions.filter(
-        (tx) => tx.addedBy.toString() === member._id.toString(),
-      );
-
-      const credited = memberTxns
-        .filter((tx) => tx.type === "credit")
-        .reduce((sum, tx) => sum + tx.amount, 0);
-
-      const debited = memberTxns
-        .filter((tx) => tx.type === "debit")
-        .reduce((sum, tx) => sum + tx.amount, 0);
-
-      memberBreakdown.push({
+    const memberBreakdown = ((pool as any).members as any[]).map((member) => {
+      const entry = byMember.get(String(member._id)) ?? {
+        credited: 0,
+        debited: 0,
+      };
+      return {
         userId: member._id,
         name: member.name,
-        totalCredited: credited,
-        totalDebited: debited,
-        net: credited - debited,
-      });
-    }
+        totalCredited: entry.credited,
+        totalDebited: entry.debited,
+        net: entry.credited - entry.debited,
+      };
+    });
 
     return res.status(200).json({
       success: true,

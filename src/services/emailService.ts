@@ -1,5 +1,6 @@
 import { Resend } from "resend";
-import { RESEND_API_KEY } from "../config/envVariables.js";
+import { RESEND_API_KEY, MAIL_TRANSPORT } from "../config/envVariables.js";
+import ErrorHandler from "../middlewares/Errorhandler.js";
 
 const resend = new Resend(RESEND_API_KEY);
 
@@ -57,6 +58,27 @@ export const sendOTPEmail = async (
     </html>
   `;
 
+  /**
+   * Console transport for local development and tests.
+   *
+   * `MAIL_TRANSPORT` is forced to "resend" whenever NODE_ENV is production, so
+   * this branch is unreachable there regardless of how the environment is
+   * configured. Without it, an unset RESEND_API made every OTP request fail —
+   * so the auth flow could not be exercised locally at all, which is precisely
+   * why the mail path had only ever been tested through a mock.
+   */
+  if (MAIL_TRANSPORT === "console") {
+    console.warn(`[email] console transport — OTP for ${to} (${purpose}) is: ${otp}`);
+    return;
+  }
+
+  if (!RESEND_API_KEY) {
+    throw new ErrorHandler(
+      "Email delivery is not configured. Please try again later.",
+      503,
+    );
+  }
+
   const { error } = await resend.emails.send({
     from: FROM_EMAIL,
     to: [to],
@@ -65,6 +87,14 @@ export const sendOTPEmail = async (
   });
 
   if (error) {
-    throw new Error(`Failed to send OTP email: ${error.message}`);
+    // A provider outage is a 503, not a 500: it is transient, it is not the
+    // caller's fault, and the client should surface "try again" rather than
+    // "something went wrong". The provider's message is logged, not returned,
+    // so its internals are not leaked to clients.
+    console.error(`[email] delivery failed for ${to}:`, error.message);
+    throw new ErrorHandler(
+      "Could not send the verification email. Please try again shortly.",
+      503,
+    );
   }
 };

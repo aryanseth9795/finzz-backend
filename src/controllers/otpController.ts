@@ -1,64 +1,156 @@
 import { Request, Response, NextFunction } from "express";
-import { hash } from "bcrypt";
+import crypto from "crypto";
+import { hash, compare } from "bcrypt";
 import TryCatch from "../utils/TryCatch.js";
 import { User } from "../models/userModel.js";
+import {
+  OtpRequest,
+  OtpPurpose,
+  OTP_TTL_MS,
+  OTP_VERIFIED_GRACE_MS,
+  OTP_MAX_ATTEMPTS,
+} from "../models/otpModel.js";
 import Errorhandler from "../middlewares/Errorhandler.js";
 import { sendOTPEmail } from "../services/emailService.js";
-import sendToken from "../utils/sendtoken.js";
+import sendToken, { revokeAllRefreshGrants } from "../utils/sendtoken.js";
 
-// Helper: generate a 6-digit OTP
-const generateOTP = (): string =>
-  Math.floor(100000 + Math.random() * 900000).toString();
+/**
+ * Generate a 6-digit OTP.
+ *
+ * `crypto.randomInt` draws from the OS CSPRNG. The previous
+ * `Math.floor(100000 + Math.random() * 900000)` used V8's xorshift128+, which
+ * is not a cryptographic generator: its internal state is recoverable from a
+ * modest number of observed outputs, after which every subsequent code is
+ * predictable. For a value that is the sole credential in a password reset,
+ * that is the difference between a 10^6 search and no search at all.
+ */
+const generateOTP = (): string => crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");
 
-// Helper: 10 minutes from now
-const otpExpiry = () => new Date(Date.now() + 10 * 60 * 1000);
+const normalizeEmail = (email: string) => email.toLowerCase().trim();
+
+/** Create or replace the live OTP for (email, purpose) and email the code. */
+const issueOtp = async (email: string, purpose: OtpPurpose): Promise<void> => {
+  const otp = generateOTP();
+  const otpHash = await hash(otp, 10);
+
+  await OtpRequest.findOneAndUpdate(
+    { email, purpose },
+    {
+      email,
+      purpose,
+      otpHash,
+      attempts: 0,
+      verifiedAt: undefined,
+      expiresAt: new Date(Date.now() + OTP_TTL_MS),
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+
+  await sendOTPEmail(email, otp, purpose);
+};
+
+/**
+ * Check a submitted code, counting failures.
+ *
+ * The attempt counter is the fix for the most serious hole in the old flow:
+ * there was none. A 6-digit code has a 10^6 keyspace, the window was 10
+ * minutes, and nothing limited guesses — so `resetPassword`, which accepts
+ * `{email, otp, newPassword}` in a single call, was a brute-forceable account
+ * takeover for any address an attacker knew.
+ */
+const consumeOtp = async (
+  email: string,
+  purpose: OtpPurpose,
+  submitted: string,
+): Promise<{ ok: true } | { ok: false; message: string; status: number }> => {
+  const request = await OtpRequest.findOne({ email, purpose });
+
+  if (!request) {
+    return {
+      ok: false,
+      status: 400,
+      message: "OTP not found or expired. Please request a new one.",
+    };
+  }
+
+  if (request.expiresAt < new Date()) {
+    await OtpRequest.deleteOne({ _id: request._id });
+    return {
+      ok: false,
+      status: 400,
+      message: "OTP has expired. Please request a new one.",
+    };
+  }
+
+  if (request.attempts >= OTP_MAX_ATTEMPTS) {
+    await OtpRequest.deleteOne({ _id: request._id });
+    return {
+      ok: false,
+      status: 429,
+      message: "Too many incorrect attempts. Please request a new OTP.",
+    };
+  }
+
+  const isValid = await compare(submitted, request.otpHash);
+
+  if (!isValid) {
+    // $inc is atomic, so concurrent guesses cannot race the counter back down.
+    const updated = await OtpRequest.findOneAndUpdate(
+      { _id: request._id },
+      { $inc: { attempts: 1 } },
+      { new: true },
+    );
+    if (updated && updated.attempts >= OTP_MAX_ATTEMPTS) {
+      await OtpRequest.deleteOne({ _id: request._id });
+    }
+    const remaining = Math.max(0, OTP_MAX_ATTEMPTS - (updated?.attempts ?? 0));
+    return {
+      ok: false,
+      status: 400,
+      message: remaining
+        ? `Invalid OTP. ${remaining} attempt(s) remaining.`
+        : "Invalid OTP. Please request a new one.",
+    };
+  }
+
+  // Mark verified rather than deleting: registration is a second call that
+  // must be able to prove this email was verified moments ago.
+  await OtpRequest.updateOne(
+    { _id: request._id },
+    {
+      $set: {
+        verifiedAt: new Date(),
+        expiresAt: new Date(Date.now() + OTP_VERIFIED_GRACE_MS),
+        attempts: 0,
+      },
+    },
+  );
+
+  return { ok: true };
+};
+
+/** True when this email completed verification inside the grace window. */
+const hasFreshVerification = async (
+  email: string,
+  purpose: OtpPurpose,
+): Promise<boolean> => {
+  const request = await OtpRequest.findOne({ email, purpose });
+  return Boolean(
+    request?.verifiedAt && request.expiresAt > new Date(),
+  );
+};
 
 // ─────────────────────────────────────────────
-// POST /api/v1/users/send-otp
-// Body: { email }
-// Public – sends an OTP to the given email.
-// Used for: registration, forgot-password, and existing-user email linking.
+// POST /api/v1/users/send-otp   { email }
+// Public – sends a registration/verification OTP.
 // ─────────────────────────────────────────────
 export const sendOtp = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    const { email } = req.body as { email: string };
+    const email = normalizeEmail((req.body as { email: string }).email);
 
-    const otp = generateOTP();
-    const hashedOtp = await hash(otp, 10);
-
-    // Try to find an existing user by email (could be empty if new registration)
-    let user = await User.findOne({ email: email.toLowerCase().trim() });
-
-    if (user) {
-      // Update OTP fields on existing user
-      user.otp = hashedOtp;
-      user.otpExpiry = otpExpiry();
-      await user.save({ validateBeforeSave: false });
-    } else {
-      // Store OTP temporarily using a placeholder phone (will be replaced on register)
-      // Actually, we store the OTP in a pending user record keyed by email only
-      // For new registrations, we create a temporary user with minimal data
-      // We use a sentinel phone to hold the OTP – replaced on actual register
-      const tempPhone = `pending_${email.replace(/[^a-z0-9]/gi, "_")}_otp`;
-      const existing = await User.findOne({ phone: tempPhone });
-      if (existing) {
-        existing.otp = hashedOtp;
-        existing.otpExpiry = otpExpiry();
-        await existing.save({ validateBeforeSave: false });
-      } else {
-        await User.create({
-          name: "__pending__",
-          phone: tempPhone,
-          password: hashedOtp, // placeholder, will be replaced or deleted
-          email: email.toLowerCase().trim(),
-          emailVerified: false,
-          otp: hashedOtp,
-          otpExpiry: otpExpiry(),
-        });
-      }
-    }
-
-    await sendOTPEmail(email, otp, "verification");
+    // No sentinel User row is created any more. The OTP lives in its own
+    // collection, so an abandoned registration leaves nothing behind.
+    await issueOtp(email, "verification");
 
     res.status(200).json({
       success: true,
@@ -68,36 +160,16 @@ export const sendOtp = TryCatch(
 );
 
 // ─────────────────────────────────────────────
-// POST /api/v1/users/verify-otp
-// Body: { email, otp }
-// Public – verifies OTP. Returns { verified: true } on success.
+// POST /api/v1/users/verify-otp   { email, otp }
 // ─────────────────────────────────────────────
 export const verifyOtp = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { email, otp } = req.body as { email: string; otp: string };
+    const result = await consumeOtp(normalizeEmail(email), "verification", otp);
 
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
-    if (!user || !user.otp || !user.otpExpiry) {
-      return next(
-        new Errorhandler("OTP not found. Please request a new OTP.", 400),
-      );
+    if (!result.ok) {
+      return next(new Errorhandler(result.message, result.status));
     }
-
-    if (user.otpExpiry < new Date()) {
-      return next(
-        new Errorhandler("OTP has expired. Please request a new one.", 400),
-      );
-    }
-
-    const isValid = await user.compareOtp(otp);
-    if (!isValid) {
-      return next(new Errorhandler("Invalid OTP", 400));
-    }
-
-    // Clear OTP fields after successful verification
-    user.otp = undefined;
-    user.otpExpiry = undefined;
-    await user.save({ validateBeforeSave: false });
 
     res.status(200).json({
       success: true,
@@ -107,9 +179,8 @@ export const verifyOtp = TryCatch(
 );
 
 // ─────────────────────────────────────────────
-// POST /api/v1/users/register  (UPDATED)
-// Body: { name, phone, email, password }
-// Public – registers after OTP was verified for email.
+// POST /api/v1/users/register   { name, phone, email, password }
+// Public – registers after the email OTP was verified.
 // ─────────────────────────────────────────────
 export const registerWithEmail = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
@@ -120,37 +191,27 @@ export const registerWithEmail = TryCatch(
       email: string;
     };
 
-    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedEmail = normalizeEmail(email);
 
-    // Check phone uniqueness
-    const existingPhone = await User.findOne({ phone });
-    if (existingPhone && existingPhone.name !== "__pending__") {
+    if (!(await hasFreshVerification(normalizedEmail, "verification"))) {
+      return next(new Errorhandler("Please verify your email OTP first", 400));
+    }
+
+    // Both uniqueness checks run before any write, so a rejected registration
+    // leaves no partial state. Previously a failed register could strand a
+    // verified sentinel account holding the user's email.
+    const [existingPhone, existingEmail] = await Promise.all([
+      User.findOne({ phone }).select("_id"),
+      User.findOne({ email: normalizedEmail }).select("_id"),
+    ]);
+
+    if (existingPhone) {
       return next(
         new Errorhandler("User already exists with this phone number", 400),
       );
     }
-
-    // Find the temp user created during OTP send
-    const tempPhone = `pending_${normalizedEmail.replace(/[^a-z0-9]/gi, "_")}_otp`;
-    const tempUser = await User.findOne({ phone: tempPhone });
-
-    // If tempUser exists AND OTP is still present it means verify-otp was not called
-    if (tempUser && tempUser.otp) {
-      return next(new Errorhandler("Please verify your email OTP first", 400));
-    }
-
-    // Delete temp record
-    if (tempUser) {
-      await User.deleteOne({ _id: tempUser._id });
-    }
-
-    // Also check if any real user has this email
-    const emailUser = await User.findOne({ email: normalizedEmail });
-    if (emailUser && emailUser.name !== "__pending__") {
+    if (existingEmail) {
       return next(new Errorhandler("This email is already registered", 400));
-    }
-    if (emailUser && emailUser.name === "__pending__") {
-      await User.deleteOne({ _id: emailUser._id });
     }
 
     const user = await User.create({
@@ -161,44 +222,43 @@ export const registerWithEmail = TryCatch(
       emailVerified: true,
     });
 
-    sendToken(res, user, 201);
+    // The verification has been spent.
+    await OtpRequest.deleteOne({
+      email: normalizedEmail,
+      purpose: "verification",
+    });
+
+    await sendToken(res, user, 201, req);
   },
 );
 
 // ─────────────────────────────────────────────
-// POST /api/v1/users/forgot-password
-// Body: { email }
-// Public – sends password-reset OTP.
+// POST /api/v1/users/forgot-password   { email }
 // ─────────────────────────────────────────────
 export const forgotPassword = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    const { email } = req.body as { email: string };
+    const email = normalizeEmail((req.body as { email: string }).email);
 
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
-    if (!user) {
-      return next(
-        new Errorhandler("No account found with this email address", 404),
-      );
+    const user = await User.findOne({ email }).select("_id");
+
+    // Only send mail when the account exists — but always answer identically.
+    // The previous 404 "No account found with this email address" turned this
+    // endpoint into a free membership oracle: anyone could test an address
+    // list against the user base and learn who has a Finzz account.
+    if (user) {
+      await issueOtp(email, "reset");
     }
-
-    const otp = generateOTP();
-    user.otp = await hash(otp, 10);
-    user.otpExpiry = otpExpiry();
-    await user.save({ validateBeforeSave: false });
-
-    await sendOTPEmail(email, otp, "reset");
 
     res.status(200).json({
       success: true,
-      message: "Password reset OTP sent to your email",
+      message:
+        "If an account exists for that address, a password reset OTP has been sent.",
     });
   },
 );
 
 // ─────────────────────────────────────────────
-// POST /api/v1/users/reset-password
-// Body: { email, otp, newPassword }
-// Public – resets password after OTP verification.
+// POST /api/v1/users/reset-password   { email, otp, newPassword }
 // ─────────────────────────────────────────────
 export const resetPassword = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
@@ -207,42 +267,39 @@ export const resetPassword = TryCatch(
       otp: string;
       newPassword: string;
     };
+    const normalizedEmail = normalizeEmail(email);
 
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
-    if (!user || !user.otp || !user.otpExpiry) {
-      return next(
-        new Errorhandler("OTP not found. Please request a new one.", 400),
-      );
+    const result = await consumeOtp(normalizedEmail, "reset", otp);
+    if (!result.ok) {
+      return next(new Errorhandler(result.message, result.status));
     }
 
-    if (user.otpExpiry < new Date()) {
-      return next(
-        new Errorhandler("OTP has expired. Please request a new one.", 400),
-      );
+    const user = await User.findOne({ email: normalizedEmail }).select(
+      "+password",
+    );
+    if (!user) {
+      // Should be unreachable — an OTP only exists for a real account.
+      return next(new Errorhandler("Unable to reset password", 400));
     }
 
-    const isValid = await user.compareOtp(otp);
-    if (!isValid) {
-      return next(new Errorhandler("Invalid OTP", 400));
-    }
-
-    // Update password and clear OTP
-    user.password = newPassword; // pre-save hook will hash it
-    user.otp = undefined;
-    user.otpExpiry = undefined;
+    user.password = newPassword; // pre-save hook hashes it
     await user.save();
+
+    // A password reset exists to lock an attacker out. Leaving their refresh
+    // tokens live would defeat that entirely: they keep access for 30 days
+    // regardless of the new password.
+    await revokeAllRefreshGrants(String(user._id));
+    await OtpRequest.deleteOne({ email: normalizedEmail, purpose: "reset" });
 
     res.status(200).json({
       success: true,
-      message: "Password reset successfully",
+      message: "Password reset successfully. Please sign in again.",
     });
   },
 );
 
 // ─────────────────────────────────────────────
-// POST /api/v1/users/change-password
-// Body: { oldPassword, newPassword }
-// Protected – changes password using old password.
+// POST /api/v1/users/change-password   { oldPassword, newPassword }
 // ─────────────────────────────────────────────
 export const changePassword = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
@@ -252,41 +309,47 @@ export const changePassword = TryCatch(
       newPassword: string;
     };
 
-    const user = await User.findById(userId);
+    if (oldPassword === newPassword) {
+      return next(
+        new Errorhandler("New password must differ from the current one", 400),
+      );
+    }
+
+    const user = await User.findById(userId).select("+password");
     if (!user) {
       return next(new Errorhandler("User not found", 404));
     }
 
-    const isMatch = await user.comparePassword(oldPassword);
-    if (!isMatch) {
+    if (!(await user.comparePassword(oldPassword))) {
       return next(new Errorhandler("Current password is incorrect", 401));
     }
 
-    user.password = newPassword; // pre-save hook will hash it
+    user.password = newPassword; // pre-save hook hashes it
     await user.save();
 
-    res.status(200).json({
-      success: true,
-      message: "Password changed successfully",
-    });
+    // Same reasoning as reset: other sessions must not survive.
+    await revokeAllRefreshGrants(userId);
+
+    // Re-issue credentials so the device that made the change stays signed in.
+    await sendToken(res, user, 200, req);
   },
 );
 
 // ─────────────────────────────────────────────
-// POST /api/v1/users/verify-email
-// Body: { email, otp }
-// Protected – links and verifies email for existing users who don't have one.
+// POST /api/v1/users/send-verify-email-otp   { email }
+// Protected – sends an OTP to link an email to the signed-in account.
 // ─────────────────────────────────────────────
-export const verifyEmail = TryCatch(
+export const sendVerifyEmailOtp = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const userId = req.user.id;
-    const { email, otp } = req.body as { email: string; otp: string };
+    const normalizedEmail = normalizeEmail(
+      (req.body as { email: string }).email,
+    );
 
-    const normalizedEmail = email.toLowerCase().trim();
-
-    // Check if that email is already taken by another user
-    const emailUser = await User.findOne({ email: normalizedEmail });
-    if (emailUser && emailUser._id.toString() !== userId) {
+    const emailUser = await User.findOne({ email: normalizedEmail }).select(
+      "_id",
+    );
+    if (emailUser && String(emailUser._id) !== userId) {
       return next(
         new Errorhandler(
           "This email is already associated with another account",
@@ -295,33 +358,56 @@ export const verifyEmail = TryCatch(
       );
     }
 
-    const user = await User.findById(userId);
+    await issueOtp(normalizedEmail, "verification");
+
+    res.status(200).json({
+      success: true,
+      message: "Verification OTP sent to your email",
+    });
+  },
+);
+
+// ─────────────────────────────────────────────
+// POST /api/v1/users/verify-email   { email, otp }
+// Protected – links and verifies an email for an existing account.
+// ─────────────────────────────────────────────
+export const verifyEmail = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const userId = req.user.id;
+    const { email, otp } = req.body as { email: string; otp: string };
+    const normalizedEmail = normalizeEmail(email);
+
+    const emailUser = await User.findOne({ email: normalizedEmail }).select(
+      "_id",
+    );
+    if (emailUser && String(emailUser._id) !== userId) {
+      return next(
+        new Errorhandler(
+          "This email is already associated with another account",
+          400,
+        ),
+      );
+    }
+
+    const result = await consumeOtp(normalizedEmail, "verification", otp);
+    if (!result.ok) {
+      return next(new Errorhandler(result.message, result.status));
+    }
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { email: normalizedEmail, emailVerified: true },
+      { new: true },
+    ).select("_id email emailVerified");
+
     if (!user) {
       return next(new Errorhandler("User not found", 404));
     }
 
-    if (!user.otp || !user.otpExpiry) {
-      return next(
-        new Errorhandler("OTP not found. Please request a new OTP.", 400),
-      );
-    }
-
-    if (user.otpExpiry < new Date()) {
-      return next(
-        new Errorhandler("OTP has expired. Please request a new one.", 400),
-      );
-    }
-
-    const isValid = await user.compareOtp(otp);
-    if (!isValid) {
-      return next(new Errorhandler("Invalid OTP", 400));
-    }
-
-    user.email = normalizedEmail;
-    user.emailVerified = true;
-    user.otp = undefined;
-    user.otpExpiry = undefined;
-    await user.save({ validateBeforeSave: false });
+    await OtpRequest.deleteOne({
+      email: normalizedEmail,
+      purpose: "verification",
+    });
 
     res.status(200).json({
       success: true,
@@ -331,48 +417,6 @@ export const verifyEmail = TryCatch(
         email: user.email,
         emailVerified: user.emailVerified,
       },
-    });
-  },
-);
-
-// ─────────────────────────────────────────────
-// POST /api/v1/users/send-verify-email-otp
-// Body: { email }
-// Protected – sends OTP to the given email for linking to existing account.
-// ─────────────────────────────────────────────
-export const sendVerifyEmailOtp = TryCatch(
-  async (req: Request, res: Response, next: NextFunction) => {
-    const userId = req.user.id;
-    const { email } = req.body as { email: string };
-
-    const normalizedEmail = email.toLowerCase().trim();
-
-    // Check if email is already taken by another user
-    const emailUser = await User.findOne({ email: normalizedEmail });
-    if (emailUser && emailUser._id.toString() !== userId) {
-      return next(
-        new Errorhandler(
-          "This email is already associated with another account",
-          400,
-        ),
-      );
-    }
-
-    const user = await User.findById(userId);
-    if (!user) {
-      return next(new Errorhandler("User not found", 404));
-    }
-
-    const otp = generateOTP();
-    user.otp = await hash(otp, 10);
-    user.otpExpiry = otpExpiry();
-    await user.save({ validateBeforeSave: false });
-
-    await sendOTPEmail(normalizedEmail, otp, "verification");
-
-    res.status(200).json({
-      success: true,
-      message: "Verification OTP sent to your email",
     });
   },
 );

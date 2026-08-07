@@ -2,7 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import TryCatch from "../utils/TryCatch.js"; // default export
 import { User } from "../models/userModel.js";
 import { FriendRequest } from "../models/friendRequestModel.js";
-import { Chat } from "../models/chatModel.js";
+import { Chat, buildPairKey } from "../models/chatModel.js";
 import ErrorHandler from "../middlewares/Errorhandler.js";
 import { sendPushNotification } from "../services/notificationService.js";
 import mongoose from "mongoose";
@@ -12,11 +12,25 @@ export const searchByPhone = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { phone } = req.body;
 
-    if (!phone) {
+    /**
+     * `phone` is now guaranteed to be a string by `searchPhoneSchema` on the
+     * route, and re-checked here as defence in depth.
+     *
+     * The route previously had no schema, so `express.json()` parsed
+     * `{"phone": {"$ne": null}}` into an object and `User.findOne({ phone })`
+     * became `User.findOne({ phone: { $ne: null } })` — an operator query that
+     * returned an arbitrary user. With `{"$regex": "^"}` an attacker could walk
+     * the entire user table, harvesting every name and phone number.
+     *
+     * The fix is a type check, not escaping: MongoDB's query language treats a
+     * nested object as operators, so the vulnerability is "an object arrived
+     * where a scalar was expected".
+     */
+    if (typeof phone !== "string" || !phone.trim()) {
       return next(new ErrorHandler("Phone number is required", 400));
     }
 
-    const user: any = await User.findOne({ phone })
+    const user: any = await User.findOne({ phone: phone.trim() })
       .select("_id name phone avatar")
       .lean();
 
@@ -54,8 +68,22 @@ export const checkContacts = TryCatch(
       return next(new ErrorHandler("Maximum 200 contacts per request", 400));
     }
 
+    // Every element must be a string. Without this, an array containing an
+    // object turns `$in` into an operator match — the same injection as
+    // searchByPhone, just wrapped in an array.
+    const safeNumbers = phoneNumbers
+      .filter((p: unknown): p is string => typeof p === "string")
+      .map((p: string) => p.trim())
+      .filter(Boolean);
+
+    if (safeNumbers.length === 0) {
+      return res
+        .status(200)
+        .json({ success: true, registered: [], unregistered: [] });
+    }
+
     const registeredUsers: any = await User.find({
-      phone: { $in: phoneNumbers },
+      phone: { $in: safeNumbers },
     })
       .select("_id name phone avatar")
       .lean();
@@ -196,20 +224,81 @@ export const acceptFriendRequest = TryCatch(
     const fromUser = friendRequest.from.toString();
     const toUser = friendRequest.to.toString();
 
-    // 1. Update friend request status
-    friendRequest.status = "accepted";
-    await friendRequest.save();
+    /**
+     * All three writes now happen in one transaction, and chat creation is
+     * idempotent.
+     *
+     * Before: the status update, the two `friends` updates, and `Chat.create`
+     * were four independent awaits. A failure between them left a friendship
+     * with no chat — the exact corruption that `scripts/repairMissingChats.ts`
+     * was written to clean up. And because the client reports a failure of the
+     * *follow-up* chat refetch as "Failed to accept", users retried an already
+     * accepted request, and the unconditional `Chat.create` produced a second
+     * chat for the same pair, splitting their transaction history in two.
+     */
+    let chatId = "";
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        friendRequest.status = "accepted";
+        await friendRequest.save({ session });
 
-    // 2. Add each user to other's friends array
-    await User.updateOne({ _id: fromUser }, { $addToSet: { friends: toUser } });
-    await User.updateOne({ _id: toUser }, { $addToSet: { friends: fromUser } });
+        await User.updateOne(
+          { _id: fromUser },
+          { $addToSet: { friends: toUser } },
+          { session },
+        );
+        await User.updateOne(
+          { _id: toUser },
+          { $addToSet: { friends: fromUser } },
+          { session },
+        );
 
-    // 3. Auto-create Chat (1-to-1 "conversation" for transactions)
-    const chat = await Chat.create({
-      groupChat: false,
-      members: [fromUser, toUser],
-    });
-    const chatId = chat._id.toString();
+        /**
+         * Idempotent chat creation.
+         *
+         * The obvious `findOneAndUpdate({ members: { $all: [...], $size: 2 } },
+         * …, { upsert: true })` does NOT work: with `upsert`, MongoDB derives
+         * the new document from the query's equality conditions, and `members`
+         * appearing under both `$all` and `$size` is rejected outright with
+         * `NotSingleValueField: path 'members' is matched twice`.
+         *
+         * Upserting on the scalar `pairKey` avoids the inference problem
+         * entirely, and its unique index makes a duplicate impossible even if
+         * two requests race — the loser gets E11000 and re-reads.
+         */
+        const pairKey = buildPairKey(fromUser, toUser);
+
+        // Adopt a chat created before `pairKey` existed, so legacy pairs are
+        // not duplicated by the new lookup.
+        const legacy = await Chat.findOne({
+          groupChat: false,
+          pairKey: { $exists: false },
+          members: { $all: [fromUser, toUser] },
+        }).session(session);
+
+        if (legacy && legacy.members.length === 2) {
+          legacy.pairKey = pairKey;
+          await legacy.save({ session });
+          chatId = legacy._id.toString();
+        } else {
+          const chat = await Chat.findOneAndUpdate(
+            { pairKey },
+            {
+              $setOnInsert: {
+                groupChat: false,
+                members: [fromUser, toUser],
+                pairKey,
+              },
+            },
+            { upsert: true, new: true, session },
+          );
+          chatId = chat._id.toString();
+        }
+      });
+    } finally {
+      await session.endSession();
+    }
 
     // Send push notification
     const accepterName = await User.findById(userId)

@@ -5,25 +5,48 @@ import { Expense } from "../models/expenseModel.js";
 import { ExpenseLedger } from "../models/expenseLedgerModel.js";
 import { User } from "../models/userModel.js";
 import ErrorHandler from "../middlewares/Errorhandler.js";
+import {
+  periodOf,
+  parseTzOffset,
+  isPastPeriod,
+  monthRangeUtc,
+} from "../utils/dates.js";
+import { escapeHtml, formatCurrency } from "../utils/html.js";
+import { decodeCursor, cursorFilter, paginate } from "../utils/cursor.js";
 
 // ==========================================
 // Helper: Get or create current month's ledger
 // ==========================================
-async function getOrCreateLedger(userId: string, date: Date) {
-  const year = date.getFullYear();
-  const month = date.getMonth() + 1; // 1-12
+async function getOrCreateLedger(
+  userId: string,
+  date: Date,
+  tzOffsetMinutes = 0,
+  session?: mongoose.ClientSession,
+) {
+  // Period is derived in the USER's calendar frame, not the server's. See
+  // utils/dates.ts for why this was silently misfiling month-boundary rows.
+  const { year, month } = periodOf(date, tzOffsetMinutes);
 
-  let ledger = await ExpenseLedger.findOne({ userId, year, month });
-
-  if (!ledger) {
-    ledger = await ExpenseLedger.create({
-      userId,
-      year,
-      month,
-      status: "open",
-      totalExpenses: 0,
-    });
-  }
+  /**
+   * Upsert atomically instead of find-then-create. The previous read/write pair
+   * had a TOCTOU window: two concurrent expense submissions on the 1st of the
+   * month both found no ledger and both created one, producing duplicate
+   * ledgers for the same period with the totals split between them.
+   */
+  const ledger = await ExpenseLedger.findOneAndUpdate(
+    { userId, year, month },
+    {
+      $setOnInsert: {
+        userId,
+        year,
+        month,
+        status: "open",
+        totalExpenses: 0,
+        totalCredits: 0,
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true, session },
+  );
 
   return ledger;
 }
@@ -33,44 +56,84 @@ async function getOrCreateLedger(userId: string, date: Date) {
 // ==========================================
 export const addExpense = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
+    // `amount` is a validated, coerced, rounded number by the time it arrives
+    // (addExpenseSchema). It used to be the raw body value with no schema on
+    // the route at all, which is how `ledger.totalExpenses += amount` came to
+    // evaluate `50 + "100"` as the string "50100".
     const { amount, date, remarks, category, type } = req.body;
     const userId = req.user.id;
-
-    if (!amount || !date) {
-      return next(new ErrorHandler("Amount and date are required", 400));
-    }
+    const tzOffset = parseTzOffset(req.body.tzOffsetMinutes);
 
     const expenseType = type === "credit" ? "credit" : "debit";
     const expenseDate = new Date(date);
 
-    // Get or create the ledger for this month
-    const ledger = await getOrCreateLedger(userId, expenseDate);
+    let expense;
 
-    // Check if ledger is closed
-    if (ledger.status === "closed") {
-      return next(
-        new ErrorHandler("Cannot add expenses to a closed ledger period", 400),
-      );
+    /**
+     * The expense row and the ledger total are one fact recorded in two places,
+     * so they are written in one transaction. Previously a failure after
+     * `Expense.create` but before `ledger.save()` left an expense that no total
+     * accounted for — the ledger silently under-reported for ever.
+     */
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        const ledger = await getOrCreateLedger(
+          userId,
+          expenseDate,
+          tzOffset,
+          session,
+        );
+
+        if (ledger.status === "closed") {
+          throw new ErrorHandler(
+            "Cannot add expenses to a closed ledger period",
+            400,
+          );
+        }
+
+        const created = await Expense.create(
+          [
+            {
+              userId,
+              ledgerId: ledger._id,
+              amount,
+              type: expenseType,
+              date: expenseDate,
+              remarks,
+              category,
+            },
+          ],
+          { session },
+        );
+        expense = created[0];
+
+        /**
+         * `$inc` rather than read-modify-write.
+         *
+         * `ledger.totalExpenses += amount; await ledger.save()` reads a value
+         * into the application, adds to it, and writes it back. Two concurrent
+         * expenses both read the same starting total and the second write
+         * overwrites the first — a classic lost update, and in a ledger that
+         * means money silently disappearing from the total.
+         *
+         * `$inc` performs the addition inside the database, where it is atomic
+         * per document. It is also one round trip instead of two.
+         */
+        await ExpenseLedger.updateOne(
+          { _id: ledger._id },
+          {
+            $inc:
+              expenseType === "credit"
+                ? { totalCredits: amount }
+                : { totalExpenses: amount },
+          },
+          { session },
+        );
+      });
+    } finally {
+      await session.endSession();
     }
-
-    // Create the expense
-    const expense = await Expense.create({
-      userId,
-      ledgerId: ledger._id,
-      amount,
-      type: expenseType,
-      date: expenseDate,
-      remarks,
-      category,
-    });
-
-    // Update ledger total based on type
-    if (expenseType === "credit") {
-      ledger.totalCredits += amount;
-    } else {
-      ledger.totalExpenses += amount;
-    }
-    await ledger.save();
 
     return res.status(201).json({
       success: true,
@@ -86,35 +149,34 @@ export const addExpense = TryCatch(
 export const getExpenses = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const userId = req.user.id;
-    const { ledgerId, cursor, limit = "20" } = req.query;
-    const pageLimit = parseInt(limit as string);
+    // Coerced and bounded by getExpensesSchema; `limit` can no longer be NaN
+    // (`parseInt("abc")`) or an unbounded number chosen by the caller.
+    const { ledgerId, cursor, limit } = req.query as unknown as {
+      ledgerId?: string;
+      cursor?: string;
+      limit: number;
+    };
 
-    const query: any = { userId };
+    const query: Record<string, unknown> = { userId };
+    if (ledgerId) query.ledgerId = ledgerId;
 
-    if (ledgerId) {
-      query.ledgerId = ledgerId;
-    }
+    // Compound keyset cursor. The previous `{ date: { $lt: cursor } }` dropped
+    // every same-day row after the first on each page boundary.
+    Object.assign(query, cursorFilter(decodeCursor(cursor)));
 
-    if (cursor) {
-      query.date = { $lt: new Date(cursor as string) };
-    }
+    const rows = await Expense.find(query)
+      // `_id` must be in the sort for the tie-break in cursorFilter to be
+      // meaningful — a sort key the cursor references but the query does not
+      // order by gives no stable ordering to page through.
+      .sort({ date: -1, _id: -1 })
+      .limit(limit + 1)
+      .lean<{ _id: unknown; date: Date }[]>();
 
-    const expenses = await Expense.find(query)
-      .sort({ date: -1 })
-      .limit(pageLimit + 1)
-      .lean();
-
-    const hasMore = expenses.length > pageLimit;
-    if (hasMore) expenses.pop();
-
-    const nextCursor =
-      hasMore && expenses.length > 0
-        ? expenses[expenses.length - 1].date.toISOString()
-        : null;
+    const { items, nextCursor, hasMore } = paginate(rows, limit);
 
     return res.status(200).json({
       success: true,
-      expenses,
+      expenses: items,
       nextCursor,
       hasMore,
     });
@@ -154,34 +216,76 @@ export const editExpense = TryCatch(
 
     const oldAmount = expense.amount;
     const oldType = expense.type || "debit";
+    const tzOffset = parseTzOffset(req.body.tzOffsetMinutes);
 
-    // Update expense fields
-    if (amount !== undefined) expense.amount = amount;
-    if (date !== undefined) expense.date = new Date(date);
-    if (remarks !== undefined) expense.remarks = remarks;
-    if (category !== undefined) expense.category = category;
-    if (type !== undefined) expense.type = type;
+    /**
+     * Reversal and re-application of ledger totals now happen atomically, and
+     * a date change moves the expense to the ledger it actually belongs to.
+     *
+     * Two bugs are fixed here:
+     *
+     *  1. Read-modify-write on the ledger totals (same lost-update race as
+     *     addExpense) — replaced with `$inc` deltas.
+     *  2. Changing an expense's date left `ledgerId` pointing at the OLD
+     *     month. The row then appeared under a month it was no longer dated
+     *     to, and both months' totals were wrong: the old kept the amount, the
+     *     new never received it.
+     */
+    const newAmount = amount !== undefined ? amount : oldAmount;
+    const newType = type !== undefined ? type : oldType;
+    const newDate = date !== undefined ? new Date(date) : expense.date;
 
-    await expense.save();
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        // Which ledger should own the row after the edit?
+        const targetLedger =
+          date !== undefined
+            ? await getOrCreateLedger(userId, newDate, tzOffset, session)
+            : ledger;
 
-    const newAmount = expense.amount;
-    const newType = expense.type || "debit";
+        if (targetLedger.status === "closed") {
+          throw new ErrorHandler(
+            "Cannot move an expense into a closed ledger",
+            400,
+          );
+        }
 
-    // Update ledger totals if amount or type changed
-    if (amount !== undefined || type !== undefined) {
-      // Reverse old entry
-      if (oldType === "credit") {
-        ledger.totalCredits -= oldAmount;
-      } else {
-        ledger.totalExpenses -= oldAmount;
-      }
-      // Apply new entry
-      if (newType === "credit") {
-        ledger.totalCredits += newAmount;
-      } else {
-        ledger.totalExpenses += newAmount;
-      }
-      await ledger.save();
+        // Remove the old contribution from the ledger that currently holds it.
+        await ExpenseLedger.updateOne(
+          { _id: ledger._id },
+          {
+            $inc:
+              oldType === "credit"
+                ? { totalCredits: -oldAmount }
+                : { totalExpenses: -oldAmount },
+          },
+          { session },
+        );
+
+        // Add the new contribution to whichever ledger now owns the row.
+        await ExpenseLedger.updateOne(
+          { _id: targetLedger._id },
+          {
+            $inc:
+              newType === "credit"
+                ? { totalCredits: newAmount }
+                : { totalExpenses: newAmount },
+          },
+          { session },
+        );
+
+        expense.amount = newAmount;
+        expense.type = newType;
+        expense.date = newDate;
+        expense.ledgerId = targetLedger._id;
+        if (remarks !== undefined) expense.remarks = remarks;
+        if (category !== undefined) expense.category = category;
+
+        await expense.save({ session });
+      });
+    } finally {
+      await session.endSession();
     }
 
     return res.status(200).json({
@@ -224,17 +328,28 @@ export const deleteExpense = TryCatch(
       );
     }
 
-    // Update ledger total based on expense type
+    // Atomic decrement + delete in one transaction. Previously the ledger was
+    // decremented first and the expense deleted second, so a failure between
+    // them left the row present but no longer counted in the total.
     const expenseType = expense.type || "debit";
-    if (expenseType === "credit") {
-      ledger.totalCredits -= expense.amount;
-    } else {
-      ledger.totalExpenses -= expense.amount;
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await ExpenseLedger.updateOne(
+          { _id: ledger._id },
+          {
+            $inc:
+              expenseType === "credit"
+                ? { totalCredits: -expense.amount }
+                : { totalExpenses: -expense.amount },
+          },
+          { session },
+        );
+        await expense.deleteOne({ session });
+      });
+    } finally {
+      await session.endSession();
     }
-    await ledger.save();
-
-    // Delete the expense
-    await expense.deleteOne();
 
     return res.status(200).json({
       success: true,
@@ -650,36 +765,47 @@ export const getLedgers = TryCatch(async (req: Request, res: Response) => {
 export const closeLedger = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const userId = req.user.id;
-    const { year, month } = req.body;
+    // Coerced to numbers by closeLedgerSchema.
+    const { year, month } = req.body as { year: number; month: number };
+    const tzOffset = parseTzOffset(req.body.tzOffsetMinutes);
 
-    if (!year || !month) {
-      return next(new ErrorHandler("Year and month are required", 400));
-    }
-
-    // Check if month is in the past
-    const now = new Date();
-    const currentYear = now.getFullYear();
-    const currentMonth = now.getMonth() + 1;
-
-    if (year > currentYear || (year === currentYear && month >= currentMonth)) {
+    /**
+     * The guard that stops a user permanently locking their own current month.
+     *
+     * Previously: `if (year > currentYear || (year === currentYear && month >=
+     * currentMonth))`. `year` came off `req.body` with no schema on the route,
+     * so a client sending `"2026"` made `year === currentYear` false — the
+     * guard passed and the CURRENT ledger was closed. There is no reopen
+     * endpoint, so the user was locked out of recording anything for the rest
+     * of the month, with no recovery path.
+     *
+     * Two changes make this sound: the schema coerces to a number, and the
+     * comparison is a single ordering test on `year * 12 + month`.
+     */
+    if (!isPastPeriod(year, month, tzOffset)) {
       return next(
         new ErrorHandler("Can only close ledgers for past months", 400),
       );
     }
 
-    const ledger = await ExpenseLedger.findOne({ userId, year, month });
+    // Conditional update: the status transition and the guard are one atomic
+    // operation, so two concurrent close requests cannot both succeed.
+    const ledger = await ExpenseLedger.findOneAndUpdate(
+      { userId, year, month, status: "open" },
+      { $set: { status: "closed", closedAt: new Date() } },
+      { new: true },
+    );
 
     if (!ledger) {
-      return next(new ErrorHandler("Ledger not found", 404));
+      const existing = await ExpenseLedger.findOne({ userId, year, month })
+        .select("status")
+        .lean<{ status: string }>();
+      return next(
+        existing
+          ? new ErrorHandler("Ledger is already closed", 400)
+          : new ErrorHandler("Ledger not found", 404),
+      );
     }
-
-    if (ledger.status === "closed") {
-      return next(new ErrorHandler("Ledger is already closed", 400));
-    }
-
-    ledger.status = "closed";
-    ledger.closedAt = new Date();
-    await ledger.save();
 
     return res.status(200).json({
       success: true,
@@ -810,8 +936,8 @@ function buildExpenseExportHtml({
       ? entries.map((exp) => `
         <tr>
           <td>${new Date(exp.date).toLocaleDateString("en-IN")}</td>
-          <td>${exp.remarks || "-"}</td>
-          <td>${exp.category || "-"}</td>
+          <td>${escapeHtml(exp.remarks || "-")}</td>
+          <td>${escapeHtml(exp.category || "-")}</td>
           <td class="amount-cell ${cls}">Rs. ${exp.amount.toFixed(2)}</td>
         </tr>`).join("")
       : `<tr><td colspan="4" class="empty-row">No transactions in this section.</td></tr>`;
@@ -861,7 +987,7 @@ function buildExpenseExportHtml({
         <div class="top-item">
           <div class="top-rank">#${i + 1}</div>
           <div class="top-info">
-            <div class="top-name">${exp.remarks || exp.category || "Uncategorized"}</div>
+            <div class="top-name">${escapeHtml(exp.remarks || exp.category || "Uncategorized")}</div>
             <div class="top-date">${new Date(exp.date).toLocaleDateString("en-IN")}</div>
             <div class="top-bar-track"><div class="top-bar-fill" style="width:${pct}%;"></div></div>
           </div>
@@ -978,9 +1104,9 @@ function buildExpenseExportHtml({
       <div class="subtitle">Monthly Financial Report &bull; ${periodLabel}<br>Generated on ${generatedOn}</div>
     </div>
     <div class="user-details">
-      <strong>${user.name}</strong>
-      ${user.phone ? `<div>${user.phone}</div>` : ""}
-      ${user.email ? `<div>${user.email}</div>` : ""}
+      <strong>${escapeHtml(user.name)}</strong>
+      ${user.phone ? `<div>${escapeHtml(user.phone)}</div>` : ""}
+      ${user.email ? `<div>${escapeHtml(user.email)}</div>` : ""}
     </div>
   </div>
 

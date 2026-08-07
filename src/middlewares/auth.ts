@@ -1,57 +1,58 @@
-import jwt from "jsonwebtoken";
 import ErrorHandler from "./Errorhandler.js";
 import { NextFunction, Request, Response } from "express";
-import { JWT_SECRET, adminSecretKey } from "../config/envVariables.js";
+import {
+  verifyAccessToken,
+  verifyAdminToken,
+  TokenError,
+} from "../utils/tokens.js";
+
+/** Extract a bearer token from the Authorization header, if well-formed. */
+const bearer = (req: Request): string | undefined => {
+  const header = req.headers["authorization"];
+  if (typeof header !== "string") return undefined;
+  // Previously `.replace("Bearer ", "")`, which also accepted a bare token and
+  // silently mangled any header whose value merely contained "Bearer ".
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return match?.[1];
+};
 
 // Users Authentication
-const isAuthenticated = (
-  req: Request & { user?: { id: string } },
-  res: Response,
-  next: NextFunction,
-) => {
-  const token =
-    req.cookies["token"] ||
-    req.headers["authorization"]?.replace("Bearer ", "");
+const isAuthenticated = (req: Request, res: Response, next: NextFunction) => {
+  const token = bearer(req) || req.cookies?.["token"];
 
   if (!token) {
     return next(new ErrorHandler("Please login to access this route", 401));
   }
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as { id: string } | null;
-    if (!decoded) {
-      return next(new ErrorHandler("Invalid token", 401));
-    }
+    const decoded = verifyAccessToken(token);
     req.user = { id: decoded.id };
     next();
-  } catch (error: any) {
-    // Return 401 for ALL JWT errors (expired, invalid, malformed)
-    // This allows the client interceptor to attempt a refresh
-    if (error.name === "TokenExpiredError") {
-      return next(new ErrorHandler("Token expired", 401));
-    }
-    return next(new ErrorHandler("Invalid token", 401));
+  } catch (error) {
+    // 401 for every JWT failure (expired, invalid, wrong type) so the client
+    // interceptor can attempt exactly one refresh and then give up.
+    const message =
+      error instanceof TokenError && error.expired
+        ? "Token expired"
+        : "Invalid token";
+    return next(new ErrorHandler(message, 401));
   }
 };
 
 export default isAuthenticated;
 
 // Admin Routes Authentication
-export const adminOnly = (
-  req: Request & { user?: { id: string } },
-  res: Response,
-  next: NextFunction,
-) => {
-  const token = req.cookies["admin-token"];
+export const adminOnly = (req: Request, res: Response, next: NextFunction) => {
+  // Accept the cookie (used by the admin web app) or a bearer token, so an
+  // operator or CI job can call admin endpoints without a browser.
+  const token = req.cookies?.["admin-token"] || bearer(req);
 
-  if (!token)
+  if (!token) {
     return next(new ErrorHandler("Only Admin can access this route", 401));
+  }
 
   try {
-    const secretKey = jwt.verify(token, JWT_SECRET) as string | null;
-    const isMatched = secretKey === adminSecretKey;
-    if (!isMatched)
-      return next(new ErrorHandler("Only Admin can access this route", 401));
+    verifyAdminToken(token);
     next();
   } catch {
     return next(new ErrorHandler("Only Admin can access this route", 401));

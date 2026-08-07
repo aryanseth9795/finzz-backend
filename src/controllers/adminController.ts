@@ -1,46 +1,78 @@
 import { NextFunction, Request, Response } from "express";
 import mongoose from "mongoose";
-import jwt from "jsonwebtoken";
+import crypto from "crypto";
 import TryCatch from "../utils/TryCatch.js";
 import { User } from "../models/userModel.js";
 import { Expense } from "../models/expenseModel.js";
 import { ExpenseLedger } from "../models/expenseLedgerModel.js";
 import { Pool } from "../models/poolModel.js";
 import { Tx } from "../models/txModel.js";
+import { Chat } from "../models/chatModel.js";
+import { FriendRequest } from "../models/friendRequestModel.js";
+import { MonthlySummary } from "../models/monthlySummaryModel.js";
 import { Notification } from "../models/notificationModel.js";
 import ErrorHandler from "../middlewares/Errorhandler.js";
-import { JWT_SECRET, adminSecretKey } from "../config/envVariables.js";
-import { Expo, ExpoPushMessage } from "expo-server-sdk";
+import { adminSecretKey } from "../config/envVariables.js";
+import { signAdminToken } from "../utils/tokens.js";
+import { buildSearchRegex } from "../utils/escapeRegex.js";
+import {
+  broadcastPushNotification,
+  sendBulkPushNotifications,
+} from "../services/notificationService.js";
 import { PoolTx } from "../models/poolTxModel.js";
 
-const expo = new Expo();
+/**
+ * Cookie options for the admin session.
+ *
+ * `sameSite: "none"` is required only because the admin SPA and this API are on
+ * different registrable domains. `partitioned` opts into CHIPS so the cookie
+ * survives third-party-cookie restrictions (Safari ITP blocks it otherwise).
+ * The durable fix is to serve the API from a subdomain of the admin origin,
+ * at which point this can become `sameSite: "lax"` and the CSRF surface closes
+ * entirely — see the Phase 4 notes.
+ */
+const ADMIN_COOKIE_OPTIONS = {
+  httpOnly: true,
+  sameSite: "none" as const,
+  secure: true,
+  partitioned: true,
+  path: "/",
+};
 
 // ==========================================
 // Admin Login (secret key)
 // ==========================================
-// console.log(adminSecretKey)
 export const adminLogin = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { secretKey } = req.body;
-    if (!secretKey || secretKey !== adminSecretKey) {
+
+    // Compare in constant time. A plain `!==` returns as soon as it finds a
+    // differing byte, so response timing leaks a prefix-match oracle that turns
+    // an exponential guess into a linear one.
+    const provided = Buffer.from(String(secretKey ?? ""), "utf8");
+    const expected = Buffer.from(adminSecretKey, "utf8");
+    const matches =
+      provided.length === expected.length &&
+      crypto.timingSafeEqual(provided, expected);
+
+    if (!matches) {
       return next(new ErrorHandler("Invalid admin secret key", 401));
     }
 
-    // Create admin JWT token
-    const token = jwt.sign(adminSecretKey, JWT_SECRET);
+    const token = signAdminToken();
 
     res
       .status(200)
       .cookie("admin-token", token, {
-        maxAge: 1000 * 60 * 60 * 24, // 24 hours
-        httpOnly: true,
-        sameSite: "none",
-        secure: true,
+        ...ADMIN_COOKIE_OPTIONS,
+        maxAge: 1000 * 60 * 60 * 12, // must match ADMIN_TOKEN_EXPIRES_IN
       })
+      // The token is deliberately NOT returned in the body. It was previously,
+      // which defeated `httpOnly`: the value became readable from JS, devtools,
+      // and any logging proxy. The admin SPA has always used only the cookie.
       .json({
         success: true,
         message: "Admin authenticated successfully",
-        token,
       });
   },
 );
@@ -50,18 +82,12 @@ export const adminLogin = TryCatch(
 // ==========================================
 export const adminLogout = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    res
-      .status(200)
-      .cookie("admin-token", "", {
-        maxAge: 0,
-        httpOnly: true,
-        sameSite: "none",
-        secure: true,
-      })
-      .json({
-        success: true,
-        message: "Admin logged out",
-      });
+    // clearCookie must receive the same attributes used to set it, or the
+    // browser treats it as a different cookie and the session survives.
+    res.status(200).clearCookie("admin-token", ADMIN_COOKIE_OPTIONS).json({
+      success: true,
+      message: "Admin logged out",
+    });
   },
 );
 
@@ -220,11 +246,11 @@ export const getAllUsers = TryCatch(
     const sort = (req.query.sort as string) || "-_id";
 
     const filter: any = {};
-    if (search) {
-      filter.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { phone: { $regex: search, $options: "i" } },
-      ];
+    // Escaped and length-capped: an unescaped `$regex` let any search term be
+    // a ReDoS payload, and an unbalanced "(" was a 500. See escapeRegex.ts.
+    const searchMatcher = buildSearchRegex(search);
+    if (searchMatcher) {
+      filter.$or = [{ name: searchMatcher }, { phone: searchMatcher }];
     }
 
     const [users, total] = await Promise.all([
@@ -280,9 +306,15 @@ export const getUserDetail = TryCatch(
 
     // Get user's pools
     const pools = await Pool.find({
-      $or: [{ createdBy: id }, { "members.userId": id }],
+      // Was `{ createdBy: id }` and `{ "members.userId": id }` — neither field
+      // exists on the Pool schema (it has `admin`, and `members` is a flat
+      // ObjectId array), so this query silently matched nothing and the admin
+      // UI reported "0 pools" for every user, including pool administrators.
+      $or: [{ admin: id }, { members: id }],
     })
-      .select("name status totalBalance")
+      // `totalBalance` is likewise not a field on Pool; requesting it returned
+      // undefined rather than erroring.
+      .select("name status members admin")
       .lean();
 
     // Get user's ledgers
@@ -311,28 +343,104 @@ export const deleteUser = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { id } = req.params;
 
+    if (!mongoose.isValidObjectId(id)) {
+      return next(new ErrorHandler("Invalid user id", 400));
+    }
+
     const user = await User.findById(id);
     if (!user) {
       return next(new ErrorHandler("User not found", 404));
     }
 
-    // Delete related data
-    await Promise.all([
-      Expense.deleteMany({ userId: id }),
-      ExpenseLedger.deleteMany({ userId: id }),
-      Notification.deleteMany({
-        $or: [{ recipient: id }, { sender: id }],
-      }),
-      Tx.deleteMany({
-        $or: [{ addedBy: id }, { verifiedBy: id }],
-      }),
-    ]);
+    const userId = new mongoose.Types.ObjectId(id);
 
-    await User.findByIdAndDelete(id);
+    /**
+     * The previous cascade deleted four collections and missed six. Every miss
+     * left a dangling ObjectId that Mongoose `populate` resolves to `null`,
+     * and the mobile client dereferences those without a guard — so deleting
+     * one account produced a crash on the *counterparty's* home screen.
+     *
+     * Specifically missed before: Chat documents, the `friends` arrays of every
+     * other user, FriendRequest rows, MonthlySummary documents, PoolTx rows,
+     * Pool membership, and Tx rows where the user was only `from`/`to`
+     * (the old filter covered `addedBy`/`verifiedBy` only).
+     *
+     * The whole cascade now runs inside one transaction: a partial delete is
+     * strictly worse than no delete, because it produces exactly the dangling
+     * references this is meant to eliminate.
+     */
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        // Chats this user belonged to, and everything hanging off them.
+        const chats = await Chat.find({ members: userId })
+          .select("_id")
+          .session(session)
+          .lean();
+        const chatIds = chats.map((c) => c._id);
+
+        await Promise.all([
+          // Own data
+          Expense.deleteMany({ userId }, { session }),
+          ExpenseLedger.deleteMany({ userId }, { session }),
+
+          // Anything referencing the user from either direction
+          Notification.deleteMany(
+            { $or: [{ recipient: userId }, { sender: userId }] },
+            { session },
+          ),
+          Tx.deleteMany(
+            {
+              $or: [
+                { addedBy: userId },
+                { verifiedBy: userId },
+                { from: userId },
+                { to: userId },
+              ],
+            },
+            { session },
+          ),
+          FriendRequest.deleteMany(
+            { $or: [{ from: userId }, { to: userId }] },
+            { session },
+          ),
+
+          // Shared structures: remove the reference, keep the structure.
+          User.updateMany(
+            { friends: userId },
+            { $pull: { friends: userId } },
+            { session },
+          ),
+          Pool.updateMany(
+            { members: userId },
+            { $pull: { members: userId } },
+            { session },
+          ),
+          PoolTx.deleteMany({ addedBy: userId }, { session }),
+        ]);
+
+        // Chats are 1:1, so a chat the user belonged to has no meaning without
+        // them. Delete the chat and its derived monthly summaries together.
+        if (chatIds.length > 0) {
+          await MonthlySummary.deleteMany(
+            { chatId: { $in: chatIds } },
+            { session },
+          );
+          await Chat.deleteMany({ _id: { $in: chatIds } }, { session });
+        }
+
+        // Pools this user administered are left intact but orphaned of an
+        // admin, which the pool endpoints already handle; deleting other
+        // members' shared financial history would be a larger, separate call.
+        await User.deleteOne({ _id: userId }, { session });
+      });
+    } finally {
+      await session.endSession();
+    }
 
     res.status(200).json({
       success: true,
-      message: "User and related data deleted",
+      message: "User and all related data deleted",
     });
   },
 );
@@ -358,15 +466,57 @@ export const getAllExpenses = TryCatch(
       filter.userId = new mongoose.Types.ObjectId(userId);
     }
 
-    const [expenses, total] = await Promise.all([
+    /**
+     * Totals over the WHOLE filtered set, not just the returned page.
+     *
+     * The admin UI was computing its "Total Amount" — and its category and
+     * daily charts — by reducing over the 50 rows it happened to have
+     * fetched, then exporting that as a PDF headed "Period: All Time". On a
+     * 500-row filter the document stated a total that was a tenth of the
+     * truth, in a file that detaches from the UI and gets emailed and filed.
+     *
+     * A client cannot compute a total it does not hold, so the aggregate has
+     * to come from here. `$facet` runs both pipelines in one round trip.
+     */
+    const [expenses, total, aggregate] = await Promise.all([
       Expense.find(filter)
-        .sort({ date: -1 })
+        .sort({ date: -1, _id: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
         .populate("userId", "name phone")
         .lean(),
       Expense.countDocuments(filter),
+      Expense.aggregate([
+        { $match: filter },
+        {
+          $facet: {
+            overall: [
+              {
+                $group: {
+                  _id: null,
+                  totalAmount: { $sum: "$amount" },
+                  count: { $sum: 1 },
+                },
+              },
+            ],
+            byCategory: [
+              {
+                $group: {
+                  _id: { $ifNull: ["$category", "Uncategorised"] },
+                  total: { $sum: "$amount" },
+                  count: { $sum: 1 },
+                },
+              },
+              { $sort: { total: -1 } },
+              { $limit: 20 },
+            ],
+          },
+        },
+      ]),
     ]);
+
+    const facet = aggregate[0] ?? { overall: [], byCategory: [] };
+    const overall = facet.overall?.[0] ?? { totalAmount: 0, count: 0 };
 
     res.status(200).json({
       success: true,
@@ -376,6 +526,17 @@ export const getAllExpenses = TryCatch(
         limit,
         total,
         pages: Math.ceil(total / limit),
+      },
+      totals: {
+        totalAmount: overall.totalAmount,
+        count: overall.count,
+        byCategory: (facet.byCategory ?? []).map(
+          (c: { _id: string; total: number; count: number }) => ({
+            name: c._id,
+            total: c.total,
+            count: c.count,
+          }),
+        ),
       },
     });
   },
@@ -418,23 +579,27 @@ export const getAllPools = TryCatch(
 // ==========================================
 export const getPoolDashboardStats = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    const [activePools, closedPools, allPoolTxns] = await Promise.all([
+    /**
+     * Was `PoolTx.find().lean()` — every pool transaction in the database
+     * loaded into the Node heap and summed in application code. On a 512 MB
+     * instance that is the most likely single cause of an OOM restart, and the
+     * admin UI re-invoked it on every pagination click.
+     *
+     * `$group` does the same arithmetic inside the database over a covered
+     * index, transferring two numbers instead of the whole collection. Cost
+     * goes from O(documents) in memory and bandwidth to O(1) in both.
+     */
+    const [activePools, closedPools, totals] = await Promise.all([
       Pool.countDocuments({ status: "active" }),
       Pool.countDocuments({ status: "closed" }),
-      PoolTx.find().lean(),
+      PoolTx.aggregate<{ _id: "credit" | "debit"; total: number }>([
+        { $group: { _id: "$type", total: { $sum: "$amount" } } },
+      ]),
     ]);
 
-    let totalCredited = 0;
-    let totalDebited = 0;
-
-    allPoolTxns.forEach((tx) => {
-      if (tx.type === "credit") {
-        totalCredited += tx.amount;
-      } else if (tx.type === "debit") {
-        totalDebited += tx.amount;
-      }
-    });
-
+    const totalCredited =
+      totals.find((t) => t._id === "credit")?.total ?? 0;
+    const totalDebited = totals.find((t) => t._id === "debit")?.total ?? 0;
     const netBalance = totalCredited - totalDebited;
 
     res.status(200).json({
@@ -507,49 +672,29 @@ export const sendBulkNotification = TryCatch(
       return next(new ErrorHandler("Title is required", 400));
     }
 
-    // Get all users with push tokens
-    const users = await User.find({
-      pushToken: { $exists: true, $ne: "" },
-    })
-      .select("_id pushToken")
-      .lean();
+    const report = await broadcastPushNotification(title, body, {
+      type: "admin_broadcast",
+    });
 
-    if (users.length === 0) {
+    if (report.recipients === 0) {
       return next(new ErrorHandler("No users with push tokens found", 404));
-    }
-
-    // Build messages
-    const messages: ExpoPushMessage[] = [];
-    for (const user of users) {
-      const token = (user as any).pushToken;
-      if (token && Expo.isExpoPushToken(token)) {
-        messages.push({
-          to: token,
-          sound: "default",
-          title,
-          body,
-          data: { type: "admin_broadcast" },
-        });
-      }
-    }
-
-    // Send in chunks
-    const chunks = expo.chunkPushNotifications(messages);
-    let sentCount = 0;
-    for (const chunk of chunks) {
-      try {
-        await expo.sendPushNotificationsAsync(chunk);
-        sentCount += chunk.length;
-      } catch (error) {
-        console.error("Error sending bulk notifications:", error);
-      }
     }
 
     res.status(200).json({
       success: true,
-      message: `Notification sent to ${sentCount} users`,
-      totalUsersWithTokens: users.length,
-      sentCount,
+      message:
+        `Delivered to ${report.accepted} device(s) across ${report.recipients} user(s); ` +
+        `${report.rejected} rejected.`,
+      // Three distinct numbers, because they mean three different things.
+      // `sentCount` previously counted messages *submitted* to Expo and was
+      // reported to the operator as a delivery count.
+      recipients: report.recipients,
+      accepted: report.accepted,
+      rejected: report.rejected,
+      /** @deprecated use `accepted`. Retained so the current admin build keeps working. */
+      sentCount: report.accepted,
+      /** @deprecated use `recipients`. */
+      totalUsersWithTokens: report.recipients,
     });
   },
 );
@@ -569,15 +714,23 @@ export const sendTargetedNotification = TryCatch(
       return next(new ErrorHandler("Please select at least one user", 400));
     }
 
-    // Get selected users with push tokens
-    const users = await User.find({
-      _id: { $in: userIds },
-      pushToken: { $exists: true, $ne: "" },
-    })
-      .select("_id pushToken")
-      .lean();
+    const invalid = userIds.filter(
+      (id: unknown) => !mongoose.isValidObjectId(id as string),
+    );
+    if (invalid.length > 0) {
+      return next(new ErrorHandler("One or more user ids are invalid", 400));
+    }
 
-    if (users.length === 0) {
+    const report = await sendBulkPushNotifications(
+      userIds.map((userId: string) => ({
+        userId,
+        title,
+        body,
+        data: { type: "admin_targeted" },
+      })),
+    );
+
+    if (report.accepted === 0 && report.rejected === 0) {
       return next(
         new ErrorHandler(
           "None of the selected users have valid push tokens",
@@ -586,38 +739,17 @@ export const sendTargetedNotification = TryCatch(
       );
     }
 
-    // Build messages
-    const messages: ExpoPushMessage[] = [];
-    for (const user of users) {
-      const token = (user as any).pushToken;
-      if (token && Expo.isExpoPushToken(token)) {
-        messages.push({
-          to: token,
-          sound: "default",
-          title,
-          body,
-          data: { type: "admin_targeted" },
-        });
-      }
-    }
-
-    // Send in chunks
-    const chunks = expo.chunkPushNotifications(messages);
-    let sentCount = 0;
-    for (const chunk of chunks) {
-      try {
-        await expo.sendPushNotificationsAsync(chunk);
-        sentCount += chunk.length;
-      } catch (error) {
-        console.error("Error sending targeted notifications:", error);
-      }
-    }
-
     res.status(200).json({
       success: true,
-      message: `Notification sent to ${sentCount} out of ${userIds.length} selected users`,
+      message:
+        `Delivered to ${report.accepted} device(s); ${report.rejected} rejected, ` +
+        `${report.skipped} of ${userIds.length} selected user(s) had no push token.`,
       totalSelectedUsers: userIds.length,
-      sentCount,
+      accepted: report.accepted,
+      rejected: report.rejected,
+      skipped: report.skipped,
+      /** @deprecated use `accepted`. */
+      sentCount: report.accepted,
     });
   },
 );

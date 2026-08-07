@@ -10,6 +10,8 @@ import {
   updateSummaryOnAdd,
   updateSummaryOnDelete,
 } from "../services/summaryService.js";
+import { decodeCursor, cursorFilter, encodeCursor } from "../utils/cursor.js";
+import { monthRangeUtc, parseTzOffset, currentPeriod } from "../utils/dates.js";
 
 type TxStatus = "pending" | "verified" | "rejected";
 
@@ -63,11 +65,24 @@ async function getChatMemberIds(
   return chat.members.map((member) => member.toString());
 }
 
-function ensureCurrentMonth(txDate: Date, message: string) {
-  const now = new Date();
-  const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+/**
+ * Reject a transaction dated before the current month.
+ *
+ * Previously `new Date(now.getFullYear(), now.getMonth(), 1)` built the month
+ * boundary from the SERVER's local time, while the date being tested came from
+ * the user's device. On a UTC-hosted server an IST user submitting a
+ * transaction during the first 5½ hours of the 1st was told their own current
+ * month was "closed". The boundary is now computed in the caller's frame.
+ */
+function ensureCurrentMonth(
+  txDate: Date,
+  message: string,
+  tzOffsetMinutes = 0,
+) {
+  const { year, month } = currentPeriod(tzOffsetMinutes);
+  const { start } = monthRangeUtc(year, month, tzOffsetMinutes);
 
-  if (txDate < currentMonthStart) {
+  if (txDate < start) {
     throw new ErrorHandler(message, 400);
   }
 }
@@ -135,6 +150,7 @@ export const addtxns = TryCatch(
     ensureCurrentMonth(
       txDate,
       "Cannot add transactions to closed months. Only current month is allowed.",
+      parseTzOffset(req.body.tzOffsetMinutes),
     );
 
     const memberIds = await getChatMemberIds(chatId);
@@ -197,6 +213,7 @@ export const getTxns = TryCatch(
       ? Number.parseInt(req.query.month as string, 10)
       : undefined;
     const userId = req.user.id;
+    const tzOffset = parseTzOffset(req.query.tzOffsetMinutes);
 
     const memberIds = await getChatMemberIds(chatId);
     if (!memberIds.includes(userId)) {
@@ -207,24 +224,32 @@ export const getTxns = TryCatch(
       chatId: new mongoose.Types.ObjectId(chatId),
     };
 
-    // Month filter (if year and month provided)
+    // Month filter. `monthRangeUtc` builds the range in the user's calendar
+    // frame rather than the server's local time, so a request for "August" no
+    // longer silently excludes the first hours of the 1st for users east of UTC.
     if (year && month) {
-      const monthStart = new Date(year, month - 1, 1);
-      const monthEnd = new Date(year, month, 1);
-      query.date = { $gte: monthStart, $lt: monthEnd };
+      const { start, end } = monthRangeUtc(year, month, tzOffset);
+      query.date = { $gte: start, $lt: end };
     }
 
-    // Cursor pagination (within the month if filtered)
-    if (cursor) {
-      const cursorDate = new Date(cursor);
-      if (query.date && typeof query.date === "object") {
-        (query.date as Record<string, Date>).$lt = cursorDate;
-      } else {
-        query.date = { $lt: cursorDate };
-      }
-    }
+    /**
+     * Compound keyset cursor.
+     *
+     * The old code mutated `query.date.$lt` in place, which had two problems:
+     * it used the date alone as the cursor, so every same-day transaction after
+     * the first was silently skipped at each page boundary; and when a month
+     * filter was active it overwrote that filter's own `$lt` bound, so the
+     * range check and the cursor fought over one field.
+     *
+     * `$and` keeps the two concerns separate: the month range constrains the
+     * window, the cursor predicate walks within it.
+     */
+    const decoded = decodeCursor(cursor);
+    const pageFilter = cursorFilter(decoded);
+    const finalQuery =
+      Object.keys(pageFilter).length > 0 ? { $and: [query, pageFilter] } : query;
 
-    const txns = await Tx.find(query)
+    const txns = await Tx.find(finalQuery)
       .sort({ date: -1, _id: -1 })
       .limit(limit + 1)
       .populate("addedBy", "name")
@@ -235,9 +260,10 @@ export const getTxns = TryCatch(
     const hasMore = txns.length > limit;
     if (hasMore) txns.pop();
 
+    const last = txns[txns.length - 1];
     const nextCursor =
-      hasMore && txns.length > 0 && txns[txns.length - 1].date
-        ? new Date(txns[txns.length - 1].date as string | Date).toISOString()
+      hasMore && last?.date
+        ? encodeCursor(new Date(last.date as string | Date), last._id)
         : null;
 
     return res.status(200).json({
@@ -386,12 +412,30 @@ export const editTxn = TryCatch(
       }
     }
 
+    /**
+     * Re-validate the participants whenever they change.
+     *
+     * `addtxns` calls `validateTxnParticipants()`; this handler assigned `to`
+     * and `from` straight onto the document, and the route had no schema at
+     * all — so arbitrary user ids could be written into a transaction and
+     * propagated into MonthlySummary, attributing money to people who were
+     * never part of the chat.
+     */
+    const nextTo = to !== undefined ? String(to) : txn.to.toString();
+    const nextFrom = from !== undefined ? String(from) : txn.from.toString();
+
+    if (to !== undefined || from !== undefined) {
+      const memberIds = await getChatMemberIds(txn.chatId.toString());
+      // Throws ErrorHandler, caught by TryCatch — same contract as addtxns.
+      validateTxnParticipants(memberIds, nextFrom, nextTo);
+    }
+
     // Update fields
     if (amount !== undefined) txn.amount = amount;
-    if (date !== undefined) txn.date = date;
+    if (date !== undefined) txn.date = new Date(date);
     if (remarks !== undefined) txn.remarks = remarks;
-    if (to !== undefined) txn.to = to;
-    if (from !== undefined) txn.from = from;
+    txn.to = nextTo as unknown as typeof txn.to;
+    txn.from = nextFrom as unknown as typeof txn.from;
 
     // Reset status to pending for re-review; clear reject metadata
     txn.status = "pending";
