@@ -10,6 +10,7 @@ import {
   adminPoolQuerySchema,
   bulkNotificationSchema,
   targetedNotificationSchema,
+  appReleaseSchema,
 } from "../middlewares/validation.js";
 import {
   adminLogin,
@@ -26,6 +27,10 @@ import {
   sendBulkNotification,
   sendTargetedNotification,
 } from "../controllers/adminController.js";
+import {
+  getAdminRelease,
+  updateAppRelease,
+} from "../controllers/appReleaseController.js";
 
 const router = express.Router();
 
@@ -107,6 +112,15 @@ router.post(
   heavyLimiter,
   validate(targetedNotificationSchema),
   sendTargetedNotification,
+);
+
+// App release — PUT can block every install below the minimum, so it is validated.
+router.get("/app-release", adminOnly, getAdminRelease);
+router.put(
+  "/app-release",
+  adminOnly,
+  validate(appReleaseSchema),
+  updateAppRelease,
 );
 
 export default router;

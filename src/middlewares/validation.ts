@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { Request, Response, NextFunction } from "express";
+import { compareVersions } from "../utils/semver.js";
 
 //======= Shared primitives =======//
 //
@@ -513,4 +514,32 @@ export const notificationQuerySchema = z.object({
 
 export const notificationIdParamSchema = z.object({
   params: z.object({ id: objectId }),
+});
+
+//======= App release =======//
+
+const semverString = z
+  .string()
+  .trim()
+  .regex(/^\d+\.\d+\.\d+$/, "Version must look like 1.2.3");
+
+export const appReleaseSchema = z.object({
+  body: z
+    .object({
+      latestVersion: semverString,
+      minSupportedVersion: semverString,
+      apkUrl: z
+        .string()
+        .trim()
+        .url("Must be a valid URL")
+        .refine((u) => u.startsWith("https://"), "APK URL must use https"),
+      releaseNotes: shortText(1000, "Release notes").default(""),
+    })
+    .refine(
+      (b) => compareVersions(b.minSupportedVersion, b.latestVersion) <= 0,
+      {
+        message: "Minimum version cannot exceed latest version",
+        path: ["minSupportedVersion"],
+      },
+    ),
 });
