@@ -251,20 +251,14 @@ describe("BE-032 — user enumeration", () => {
     expect(unknown.status).toBe(wrongPassword.status);
   });
 
-  it("answers forgot-password identically for known and unknown addresses", async () => {
+  it("forgot-password reveals only a masked email, never the address", async () => {
     const user = await registerUser(app);
-
-    const known = await request(app)
+    const res = await request(app)
       .post("/api/v1/users/forgot-password")
-      .send({ email: user.email })
+      .send({ phone: user.phone })
       .expect(200);
-
-    const unknown = await request(app)
-      .post("/api/v1/users/forgot-password")
-      .send({ email: nextEmail() })
-      .expect(200);
-
-    expect(known.body.message).toBe(unknown.body.message);
+    expect(JSON.stringify(res.body)).not.toContain(user.email);
+    expect(res.body.maskedEmail).toMatch(/\*/);
   });
 });
 

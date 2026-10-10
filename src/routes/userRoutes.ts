@@ -35,6 +35,7 @@ import {
   sendOtpSchema,
   verifyOtpSchema,
   resetPasswordSchema,
+  forgotPasswordSchema,
   changePasswordSchema,
   verifyEmailSchema,
 } from "../middlewares/validation.js";
@@ -72,7 +73,7 @@ router.post(
 router.post(
   "/forgot-password",
   otpRequestLimiter,
-  validate(sendOtpSchema),
+  validate(forgotPasswordSchema),
   forgotPassword,
 );
 router.post(

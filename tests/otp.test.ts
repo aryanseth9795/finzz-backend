@@ -227,16 +227,12 @@ describe("Registration requires a verified email", () => {
 });
 
 describe("BE-032 / BE-034 — password reset", () => {
-  it("does not email an OTP for an address with no account", async () => {
-    const unknown = nextEmail();
-    await request(app)
+  it("reports an unknown phone and emails nothing", async () => {
+    const res = await request(app)
       .post("/api/v1/users/forgot-password")
-      .send({ email: unknown })
-      .expect(200);
-
-    // The response is deliberately identical to the success case, but no mail
-    // is actually sent — the endpoint reveals nothing either way.
-    expect(mailCount(unknown)).toBe(0);
+      .send({ phone: nextPhone() })
+      .expect(404);
+    expect(res.body.message).toBe("No account found with this number.");
   });
 
   it("completes a reset and invalidates the old password", async () => {
@@ -245,13 +241,13 @@ describe("BE-032 / BE-034 — password reset", () => {
 
     await request(app)
       .post("/api/v1/users/forgot-password")
-      .send({ email: user.email })
+      .send({ phone: user.phone })
       .expect(200);
 
     await request(app)
       .post("/api/v1/users/reset-password")
       .send({
-        email: user.email,
+        phone: user.phone,
         otp: lastOtp(user.email, "reset"),
         newPassword: "BrandNewPassw0rd!",
       })
@@ -274,12 +270,12 @@ describe("BE-032 / BE-034 — password reset", () => {
 
     await request(app)
       .post("/api/v1/users/forgot-password")
-      .send({ email: user.email })
+      .send({ phone: user.phone })
       .expect(200);
     await request(app)
       .post("/api/v1/users/reset-password")
       .send({
-        email: user.email,
+        phone: user.phone,
         otp: lastOtp(user.email, "reset"),
         newPassword: "BrandNewPassw0rd!",
       })
@@ -308,7 +304,7 @@ describe("BE-032 / BE-034 — password reset", () => {
     await request(app)
       .post("/api/v1/users/reset-password")
       .send({
-        email: user.email,
+        phone: user.phone,
         otp: verificationCode,
         newPassword: "BrandNewPassw0rd!",
       })

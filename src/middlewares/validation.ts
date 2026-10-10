@@ -158,9 +158,16 @@ export const verifyOtpSchema = z.object({
   }),
 });
 
+/** Forgot/reset password identify the account by the phone used to log in. */
+const loginPhone = z.string().trim().regex(/^\+?[1-9]\d{1,14}$/, "Invalid phone number");
+
+export const forgotPasswordSchema = z.object({
+  body: z.object({ phone: loginPhone }),
+});
+
 export const resetPasswordSchema = z.object({
   body: z.object({
-    email: z.string().email("Invalid email address"),
+    phone: loginPhone,
     otp: z.string().length(6, "OTP must be 6 digits"),
     newPassword: z.string().min(6, "Password must be at least 6 characters"),
   }),

@@ -3,6 +3,7 @@ import crypto from "crypto";
 import { hash, compare } from "bcrypt";
 import TryCatch from "../utils/TryCatch.js";
 import { phoneVariants } from "../utils/phone.js";
+import { maskEmail } from "../utils/maskEmail.js";
 import { User } from "../models/userModel.js";
 import {
   OtpRequest,
@@ -236,51 +237,68 @@ export const registerWithEmail = TryCatch(
 // ─────────────────────────────────────────────
 // POST /api/v1/users/forgot-password   { email }
 // ─────────────────────────────────────────────
+/**
+ * POST /api/v1/users/forgot-password   { phone }
+ *
+ * The user gives only the phone they log in with; the OTP goes to the email
+ * registered on that account, which is returned MASKED so they know which
+ * inbox to check. Asking for the email instead made users remember (and
+ * disclose) an address the server already knows.
+ *
+ * Whether a phone has an account is already observable through registration
+ * ("User already exists with this phone number"), so reporting an unknown
+ * number here reveals nothing new; `otpRequestLimiter` bounds probing.
+ */
 export const forgotPassword = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    const email = normalizeEmail((req.body as { email: string }).email);
+    const { phone } = req.body as { phone: string };
 
-    const user = await User.findOne({ email }).select("_id");
-
-    // Only send mail when the account exists — but always answer identically.
-    // The previous 404 "No account found with this email address" turned this
-    // endpoint into a free membership oracle: anyone could test an address
-    // list against the user base and learn who has a Finzz account.
-    if (user) {
-      await issueOtp(email, "reset");
+    const user = await User.findOne({ phone: { $in: phoneVariants(phone) } }).select("email");
+    if (!user) {
+      return next(new Errorhandler("No account found with this number.", 404));
     }
+    if (!user.email) {
+      return next(
+        new Errorhandler(
+          "No email is linked to this account. Contact support to reset your password.",
+          400,
+        ),
+      );
+    }
+
+    await issueOtp(normalizeEmail(user.email), "reset");
 
     res.status(200).json({
       success: true,
-      message:
-        "If an account exists for that address, a password reset OTP has been sent.",
+      message: "A password reset OTP has been sent to your email.",
+      maskedEmail: maskEmail(user.email),
     });
   },
 );
 
 // ─────────────────────────────────────────────
-// POST /api/v1/users/reset-password   { email, otp, newPassword }
+// POST /api/v1/users/reset-password   { phone, otp, newPassword }
 // ─────────────────────────────────────────────
 export const resetPassword = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    const { email, otp, newPassword } = req.body as {
-      email: string;
+    const { phone, otp, newPassword } = req.body as {
+      phone: string;
       otp: string;
       newPassword: string;
     };
-    const normalizedEmail = normalizeEmail(email);
+
+    // The OTP was issued to the account's email, so resolve it from the phone.
+    const user = await User.findOne({ phone: { $in: phoneVariants(phone) } }).select(
+      "+password email",
+    );
+    if (!user || !user.email) {
+      return next(new Errorhandler("Unable to reset password", 400));
+    }
+    const normalizedEmail = normalizeEmail(user.email);
 
     const result = await consumeOtp(normalizedEmail, "reset", otp);
     if (!result.ok) {
       return next(new Errorhandler(result.message, result.status));
-    }
-
-    const user = await User.findOne({ email: normalizedEmail }).select(
-      "+password",
-    );
-    if (!user) {
-      // Should be unreachable — an OTP only exists for a real account.
-      return next(new Errorhandler("Unable to reset password", 400));
     }
 
     user.password = newPassword; // pre-save hook hashes it
