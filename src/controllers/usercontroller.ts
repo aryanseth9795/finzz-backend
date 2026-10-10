@@ -1,4 +1,5 @@
 import TryCatch from "../utils/TryCatch.js";
+import { phoneVariants } from "../utils/phone.js";
 import { User } from "../models/userModel.js";
 import { Request, Response, NextFunction } from "express";
 import Errorhandler from "../middlewares/Errorhandler.js";
@@ -26,7 +27,9 @@ export const login = TryCatch(
     // `password` is `select: false` on the schema, so it must be requested
     // explicitly. That is deliberate: the field is now opt-in, which makes
     // every place that touches it greppable.
-    const user = await User.findOne({ phone }).select("+password");
+    const user = await User.findOne({ phone: { $in: phoneVariants(phone) } }).select(
+      "+password",
+    );
 
     // Same response and the same amount of work whether or not the account
     // exists. Returning "User not found" for an unknown phone number turned
@@ -44,7 +47,9 @@ export const register = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { name, phone, password } = req.body;
 
-    const existingUser = await User.findOne({ phone }).select("_id");
+    const existingUser = await User.findOne({
+      phone: { $in: phoneVariants(phone) },
+    }).select("_id");
     if (existingUser) {
       return next(new Errorhandler("User already exists", 400));
     }

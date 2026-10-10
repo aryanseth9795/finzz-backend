@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
 import { hash, compare } from "bcrypt";
 import TryCatch from "../utils/TryCatch.js";
+import { phoneVariants } from "../utils/phone.js";
 import { User } from "../models/userModel.js";
 import {
   OtpRequest,
@@ -201,7 +202,7 @@ export const registerWithEmail = TryCatch(
     // leaves no partial state. Previously a failed register could strand a
     // verified sentinel account holding the user's email.
     const [existingPhone, existingEmail] = await Promise.all([
-      User.findOne({ phone }).select("_id"),
+      User.findOne({ phone: { $in: phoneVariants(phone) } }).select("_id"),
       User.findOne({ email: normalizedEmail }).select("_id"),
     ]);
 

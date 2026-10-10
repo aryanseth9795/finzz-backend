@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from "express";
 import TryCatch from "../utils/TryCatch.js"; // default export
+import { phoneVariants, canonicalPhone } from "../utils/phone.js";
 import { User } from "../models/userModel.js";
 import { FriendRequest } from "../models/friendRequestModel.js";
 import { Chat, buildPairKey } from "../models/chatModel.js";
@@ -30,7 +31,7 @@ export const searchByPhone = TryCatch(
       return next(new ErrorHandler("Phone number is required", 400));
     }
 
-    const user: any = await User.findOne({ phone: phone.trim() })
+    const user: any = await User.findOne({ phone: { $in: phoneVariants(phone) } })
       .select("_id name phone avatar")
       .lean();
 
@@ -83,17 +84,21 @@ export const checkContacts = TryCatch(
     }
 
     const registeredUsers: any = await User.find({
-      phone: { $in: safeNumbers },
+      phone: { $in: safeNumbers.flatMap(phoneVariants) },
     })
       .select("_id name phone avatar")
       .lean();
 
     // Create a Set of registered phone numbers for fast lookup
-    const registeredPhones = new Set(registeredUsers.map((u: any) => u.phone));
+    // Compared by canonical key: a contact saved as "+91…" must match an
+    // account stored as 10 digits, and vice versa.
+    const registeredPhones = new Set(
+      registeredUsers.map((u: any) => canonicalPhone(u.phone)),
+    );
 
     // Filter unregistered phone numbers
     const unregistered = phoneNumbers.filter(
-      (phone) => !registeredPhones.has(phone),
+      (phone) => !registeredPhones.has(canonicalPhone(String(phone))),
     );
 
     return res.status(200).json({
