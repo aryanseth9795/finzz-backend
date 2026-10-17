@@ -2,7 +2,12 @@ import { NextFunction, Request, Response } from "express";
 import mongoose from "mongoose";
 import TryCatch from "../utils/TryCatch.js";
 import ErrorHandler from "../middlewares/Errorhandler.js";
-import { Note, NOTES_PER_OWNER_MAX } from "../models/noteModel.js";
+import {
+  Note,
+  NOTES_PER_OWNER_MAX,
+  NOTE_SHARES_MAX,
+  type NotePermission,
+} from "../models/noteModel.js";
 import { User } from "../models/userModel.js";
 import {
   assertCan,
@@ -13,6 +18,7 @@ import {
 import { NOTE_POPULATE, toNoteDto, type PopulatedNote } from "../utils/noteDto.js";
 import { cursorFilter, decodeCursor, paginateBy } from "../utils/cursor.js";
 import { escapeRegex } from "../utils/escapeRegex.js";
+import { sendBulkPushNotifications } from "../services/notificationService.js";
 
 // ========================
 // Helpers
@@ -272,4 +278,179 @@ export const deleteNote = TryCatch(async (req: Request, res: Response) => {
   await Note.deleteOne({ _id: noteId, owner: userId });
 
   return res.status(200).json({ success: true, message: "Note deleted" });
+});
+
+// ========================
+// Sharing (owner-controlled)
+// ========================
+
+/** Owner-only: who has access and at what level. */
+export const getNoteShares = TryCatch(async (req: Request, res: Response) => {
+  const userId = req.user.id;
+  const noteId = req.params.noteId as string;
+
+  const { role } = await loadNoteFor(noteId, userId);
+  assertCan(role, "viewShares");
+
+  const note = await Note.findById(noteId)
+    .select("shares")
+    .populate("shares.user", "name avatar")
+    .lean<{
+      shares: {
+        user: { _id: unknown; name: string; avatar?: string } | null;
+        permission: NotePermission;
+        sharedAt: Date;
+        updatedAt: Date;
+      }[];
+    }>();
+
+  const shares = (note?.shares ?? [])
+    // A deleted account populates to null; it has no access to show.
+    .filter((s) => s.user)
+    .map((s) => ({
+      user: { _id: String(s.user!._id), name: s.user!.name, avatar: s.user!.avatar },
+      permission: s.permission,
+      sharedAt: s.sharedAt,
+      updatedAt: s.updatedAt,
+    }));
+
+  return res.status(200).json({ success: true, shares });
+});
+
+/**
+ * Grant access or change permission, for one or more friends.
+ *
+ * Each recipient is one atomic update: `$push` guarded by "not already shared"
+ * and the size cap (a new share, which notifies), falling back to a positional
+ * permission change (silent). The guard makes duplicate rows impossible even
+ * when two requests race.
+ */
+export const upsertNoteShares = TryCatch(async (req: Request, res: Response) => {
+  const userId = req.user.id;
+  const noteId = req.params.noteId as string;
+  const shares = req.body.shares as { userId: string; permission: NotePermission }[];
+
+  const { note, role } = await loadNoteFor(noteId, userId);
+  assertCan(role, "manageShares");
+
+  if (shares.some((s) => s.userId === userId)) {
+    throw new ErrorHandler("You already own this note", 400);
+  }
+
+  const me = await User.findById(userId)
+    .select("name friends")
+    .lean<{ name: string; friends: mongoose.Types.ObjectId[] }>();
+  const friends = new Set((me?.friends ?? []).map(String));
+  if (shares.some((s) => !friends.has(s.userId))) {
+    throw new ErrorHandler("You can only share with friends", 400);
+  }
+
+  // Reject a batch that cannot fit before writing any of it, so a request is
+  // never half-applied. The per-user guard below still holds under races.
+  const existing = new Set(note.shares.map((s) => String(s.user)));
+  const newCount = shares.filter((s) => !existing.has(s.userId)).length;
+  if (note.shares.length + newCount > NOTE_SHARES_MAX) {
+    throw new ErrorHandler(
+      `A note can be shared with at most ${NOTE_SHARES_MAX} people`,
+      400,
+    );
+  }
+
+  const now = new Date();
+  const added: string[] = [];
+
+  for (const { userId: recipient, permission } of shares) {
+    const pushed = await Note.updateOne(
+      {
+        _id: noteId,
+        owner: userId,
+        "shares.user": { $ne: recipient },
+        $expr: { $lt: [{ $size: "$shares" }, NOTE_SHARES_MAX] },
+      },
+      {
+        $push: {
+          shares: { user: recipient, permission, sharedAt: now, updatedAt: now },
+        },
+      },
+    );
+    if (pushed.modifiedCount === 1) {
+      added.push(recipient);
+      continue;
+    }
+
+    const changed = await Note.updateOne(
+      { _id: noteId, owner: userId, "shares.user": recipient },
+      { $set: { "shares.$.permission": permission, "shares.$.updatedAt": now } },
+    );
+    if (changed.matchedCount === 0) {
+      throw new ErrorHandler(
+        `A note can be shared with at most ${NOTE_SHARES_MAX} people`,
+        400,
+      );
+    }
+  }
+
+  // Lock-screen privacy: the push names the sender, never the note's content.
+  await sendBulkPushNotifications(
+    added.map((recipient) => ({
+      userId: recipient,
+      title: "New shared note",
+      body: `${me?.name ?? "A friend"} shared a note with you`,
+      data: { type: "note_shared", senderId: userId, noteId },
+    })),
+  );
+
+  return res.status(200).json({
+    success: true,
+    note: await noteResponse(noteId, userId),
+  });
+});
+
+/**
+ * Revoke one recipient (owner), or remove yourself from a note shared with you
+ * ("leave"). A recipient can never remove anyone else.
+ */
+export const revokeNoteShare = TryCatch(async (req: Request, res: Response) => {
+  const userId = req.user.id;
+  const noteId = req.params.noteId as string;
+  const target = req.params.userId as string;
+
+  const { role } = await loadNoteFor(noteId, userId);
+
+  if (target === userId) {
+    if (role === "owner") {
+      throw new ErrorHandler("Owners can't leave their own note", 400);
+    }
+    assertCan(role, "leave");
+    await Note.updateOne({ _id: noteId }, { $pull: { shares: { user: userId } } });
+    return res.status(200).json({ success: true, message: "Removed from your notes" });
+  }
+
+  assertCan(role, "manageShares");
+
+  const result = await Note.updateOne(
+    { _id: noteId, owner: userId, "shares.user": target },
+    { $pull: { shares: { user: target } } },
+  );
+  if (result.modifiedCount === 0) {
+    throw new ErrorHandler("Share not found", 404);
+  }
+
+  return res.status(200).json({ success: true, message: "Access removed" });
+});
+
+/** Owner-only: revoke everyone and make the note private again. */
+export const revokeAllNoteShares = TryCatch(async (req: Request, res: Response) => {
+  const userId = req.user.id;
+  const noteId = req.params.noteId as string;
+
+  const { role } = await loadNoteFor(noteId, userId);
+  assertCan(role, "manageShares");
+
+  await Note.updateOne({ _id: noteId, owner: userId }, { $set: { shares: [] } });
+
+  return res.status(200).json({
+    success: true,
+    note: await noteResponse(noteId, userId),
+  });
 });

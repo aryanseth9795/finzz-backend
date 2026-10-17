@@ -2,7 +2,11 @@ import { z } from "zod";
 import { Request, Response, NextFunction } from "express";
 import { compareVersions } from "../utils/semver.js";
 import { MAX_SEARCH_LENGTH } from "../utils/escapeRegex.js";
-import { NOTE_BODY_MAX, NOTE_TITLE_MAX } from "../models/noteModel.js";
+import {
+  NOTE_BODY_MAX,
+  NOTE_SHARES_MAX,
+  NOTE_TITLE_MAX,
+} from "../models/noteModel.js";
 
 //======= Shared primitives =======//
 //
@@ -603,4 +607,27 @@ export const updateNoteSchema = z.object({
 export const noteLabelSchema = z.object({
   params: z.object({ noteId: objectId }),
   body: z.object({ personLabel: objectId.nullable() }),
+});
+
+export const shareNoteSchema = z.object({
+  params: z.object({ noteId: objectId }),
+  body: z.object({
+    shares: z
+      .array(
+        z.object({
+          userId: objectId,
+          permission: z.enum(["view", "edit"]).default("view"),
+        }),
+      )
+      .min(1, "Choose at least one person")
+      .max(NOTE_SHARES_MAX, `A note can be shared with at most ${NOTE_SHARES_MAX} people`)
+      .refine(
+        (shares) => new Set(shares.map((s) => s.userId)).size === shares.length,
+        "Each person can be listed once",
+      ),
+  }),
+});
+
+export const noteShareUserParamSchema = z.object({
+  params: z.object({ noteId: objectId, userId: objectId }),
 });

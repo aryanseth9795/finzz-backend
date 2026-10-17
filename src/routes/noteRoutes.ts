@@ -7,6 +7,8 @@ import {
   noteIdParamSchema,
   updateNoteSchema,
   noteLabelSchema,
+  shareNoteSchema,
+  noteShareUserParamSchema,
 } from "../middlewares/validation.js";
 import {
   listNotes,
@@ -16,6 +18,10 @@ import {
   updateNote,
   setNoteLabel,
   deleteNote,
+  getNoteShares,
+  upsertNoteShares,
+  revokeNoteShare,
+  revokeAllNoteShares,
 } from "../controllers/noteController.js";
 
 const router = express.Router();
@@ -37,5 +43,17 @@ router.get("/:noteId", validate(noteIdParamSchema), getNote);
 router.patch("/:noteId", validate(updateNoteSchema), updateNote);
 router.put("/:noteId/label", validate(noteLabelSchema), setNoteLabel);
 router.delete("/:noteId", validate(noteIdParamSchema), deleteNote);
+
+// ========================
+// Sharing (owner-controlled; recipients may only remove themselves)
+// ========================
+router.get("/:noteId/shares", validate(noteIdParamSchema), getNoteShares);
+router.put("/:noteId/shares", validate(shareNoteSchema), upsertNoteShares);
+router.delete(
+  "/:noteId/shares/:userId",
+  validate(noteShareUserParamSchema),
+  revokeNoteShare,
+);
+router.delete("/:noteId/shares", validate(noteIdParamSchema), revokeAllNoteShares);
 
 export default router;
