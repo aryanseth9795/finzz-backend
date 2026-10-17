@@ -9,7 +9,10 @@ import {
   isProduction,
 } from "./src/config/envVariables.js";
 import connectDb from "./src/db/db.js";
-import { startActivityFlush } from "./src/services/activityTracker.js";
+import {
+  flushActivity,
+  startActivityFlush,
+} from "./src/services/activityTracker.js";
 
 /**
  * Process bootstrap. The Express application itself lives in `src/app.ts` and
@@ -74,6 +77,12 @@ const start = async () => {
     stopActivityFlush();
 
     server.close(async () => {
+      try {
+        // Persist the last buffered counts while the connection is still open.
+        await flushActivity();
+      } catch (error) {
+        console.error("[shutdown] error flushing activity:", error);
+      }
       try {
         await mongoose.connection.close(false);
       } catch (error) {

@@ -442,6 +442,9 @@ export const deleteUser = TryCatch(
             { $set: { personLabel: null } },
             { session },
           ),
+
+          // Per-user traffic analytics.
+          DailyActivity.deleteMany({ user: userId }, { session }),
         ]);
 
         // Chats are 1:1, so a chat the user belonged to has no meaning without
@@ -815,7 +818,7 @@ export const getTrafficAnalytics = TryCatch(
         ANALYTICS_TZ_OFFSET_MINUTES * 60_000,
     );
 
-    const [perDay, traffic, newUsersPerDay, wauAgg, mauAgg, top] =
+    const [perDay, traffic, newUsersPerDay, wauAgg, mauAgg, top, firstTraffic] =
       await Promise.all([
         DailyActivity.aggregate([
           { $match: { day: { $gte: firstDay, $lte: today } } },
@@ -860,6 +863,7 @@ export const getTrafficAnalytics = TryCatch(
           .limit(10)
           .select("user requests opens lastSeenAt")
           .lean(),
+        DailyTraffic.findOne().sort({ day: 1 }).select("day").lean(),
       ]);
 
     const activityByDay = new Map<string, { activeUsers: number; opens: number }>(
@@ -892,6 +896,7 @@ export const getTrafficAnalytics = TryCatch(
 
     res.status(200).json({
       success: true,
+      trackingSince: firstTraffic?.day ?? null,
       today: {
         activeUsers: todayRow.activeUsers,
         opens: todayRow.opens,

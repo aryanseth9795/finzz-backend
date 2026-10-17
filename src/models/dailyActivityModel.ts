@@ -42,8 +42,8 @@ const dailyActivitySchema = new Schema<IDailyActivity>(
   { versionKey: false },
 );
 
+// Unique (day, user); its prefix also serves queries on `day` alone.
 dailyActivitySchema.index({ day: 1, user: 1 }, { unique: true });
-dailyActivitySchema.index({ day: 1 });
 // Retention is enforced by the database.
 dailyActivitySchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 

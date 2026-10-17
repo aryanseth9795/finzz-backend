@@ -68,8 +68,11 @@ app.get("/health", (_req, res) => {
 
 // Daily traffic counter (in-memory buffer, flushed to the DB on a timer).
 // `req.user` is read at response end, after isAuthenticated has had its say.
+// The admin panel's own calls are skipped so they don't inflate "requests".
 app.use("/api", (req, res, next) => {
-  res.on("finish", () => recordRequest(!!req.user));
+  if (!req.originalUrl.startsWith("/api/v1/admin")) {
+    res.on("finish", () => recordRequest(!!req.user));
+  }
   next();
 });
 

@@ -1,4 +1,13 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+  vi,
+} from "vitest";
 import request from "supertest";
 import mongoose from "mongoose";
 import "./mailbox.js";
@@ -11,6 +20,7 @@ import {
   syncIndexes,
   registerUser,
   auth,
+  adminCookie,
 } from "./helpers.js";
 import {
   dayKey,
@@ -176,5 +186,157 @@ describe("through the real app", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].requests).toBe(1);
     expect(rows[0].authedRequests).toBe(0);
+  });
+});
+
+describe("admin traffic is excluded from the request counter", () => {
+  it("does not count /api/v1/admin calls, but still counts other API calls", async () => {
+    const cookie = await adminCookie(app);
+    await request(app)
+      .get("/api/v1/admin/analytics/traffic")
+      .set("Cookie", cookie)
+      .expect(200);
+    await settle();
+    // The traffic endpoint flushes; drop whatever it wrote and start clean.
+    await DailyTraffic.deleteMany({});
+    _resetActivityBuffersForTests();
+
+    await request(app)
+      .get("/api/v1/admin/analytics/traffic")
+      .set("Cookie", cookie)
+      .expect(200);
+    await request(app).get("/api/v1/users/profile").expect(401);
+    await settle();
+    await flushActivity();
+
+    const rows = await DailyTraffic.find().lean();
+    expect(rows).toHaveLength(1);
+    // Only the non-admin call is counted.
+    expect(rows[0].requests).toBe(1);
+  });
+});
+
+describe("partial bulkWrite failures", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("merges back only the ops listed in writeErrors", async () => {
+    const a = new mongoose.Types.ObjectId().toString();
+    const b = new mongoose.Types.ObjectId().toString();
+    const now = new Date("2026-10-17T05:00:00Z");
+    recordActivity(a, { now });
+    recordActivity(b, { now });
+
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const real = DailyActivity.bulkWrite.bind(DailyActivity);
+    const spy = vi.spyOn(DailyActivity, "bulkWrite").mockImplementationOnce(
+      (async (ops: any[]) => {
+        // Apply op 0 for real, fail op 1: exactly what an unordered bulk does.
+        await real([ops[0]], { ordered: false });
+        const err: any = new Error("partial");
+        err.name = "MongoBulkWriteError";
+        err.writeErrors = [{ index: 1, errmsg: "boom" }];
+        throw err;
+      }) as any,
+    );
+
+    const first = await flushActivity();
+    expect(first.activityRows).toBe(1);
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    // Second flush retries only user b. If a were merged back too it would
+    // be counted twice.
+    await flushActivity();
+    const rows = await DailyActivity.find().sort({ user: 1 }).lean();
+    expect(rows).toHaveLength(2);
+    for (const r of rows) expect(r.requests).toBe(1);
+  });
+
+  it("treats a lone writeConcernError as applied (no retry, no double count)", async () => {
+    const a = new mongoose.Types.ObjectId().toString();
+    recordActivity(a, { now: new Date("2026-10-17T05:00:00Z") });
+
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const real = DailyActivity.bulkWrite.bind(DailyActivity);
+    vi.spyOn(DailyActivity, "bulkWrite").mockImplementationOnce(
+      (async (ops: any[]) => {
+        await real(ops, { ordered: false });
+        const err: any = new Error("wc");
+        err.name = "MongoBulkWriteError";
+        err.writeErrors = [];
+        err.writeConcernError = { errmsg: "timeout" };
+        throw err;
+      }) as any,
+    );
+
+    const res = await flushActivity();
+    expect(res.activityRows).toBe(1);
+    await flushActivity();
+    const rows = await DailyActivity.find({ user: a }).lean();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].requests).toBe(1);
+  });
+
+  it("still restores everything on a non-bulk error", async () => {
+    const a = new mongoose.Types.ObjectId().toString();
+    recordActivity(a, { now: new Date("2026-10-17T05:00:00Z") });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(DailyActivity, "bulkWrite").mockRejectedValueOnce(
+      new Error("network down"),
+    );
+    expect((await flushActivity()).activityRows).toBe(0);
+    expect((await flushActivity()).activityRows).toBe(1);
+    expect((await DailyActivity.findOne({ user: a }).lean())!.requests).toBe(1);
+  });
+});
+
+describe("flush error log throttle", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("logs a repeated flush failure at most once per minute", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(DailyActivity, "bulkWrite").mockRejectedValue(new Error("down"));
+    const a = new mongoose.Types.ObjectId().toString();
+    for (let i = 0; i < 3; i++) {
+      recordActivity(a);
+      await flushActivity();
+    }
+    const flushLogs = errSpy.mock.calls.filter((c) =>
+      String(c[0]).includes("[activity] flush failed"),
+    );
+    expect(flushLogs).toHaveLength(1);
+  });
+});
+
+describe("ANALYTICS_TZ_OFFSET_MINUTES validation", () => {
+  const saved = process.env.ANALYTICS_TZ_OFFSET_MINUTES;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.ANALYTICS_TZ_OFFSET_MINUTES;
+    else process.env.ANALYTICS_TZ_OFFSET_MINUTES = saved;
+    vi.restoreAllMocks();
+    vi.resetModules();
+  });
+
+  const load = async (value: string | undefined) => {
+    if (value === undefined) delete process.env.ANALYTICS_TZ_OFFSET_MINUTES;
+    else process.env.ANALYTICS_TZ_OFFSET_MINUTES = value;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.resetModules();
+    await import("../src/services/activityTracker.js");
+    const calls = warn.mock.calls.filter((c) =>
+      String(c[0]).includes("ANALYTICS_TZ_OFFSET_MINUTES"),
+    );
+    warn.mockRestore();
+    return calls;
+  };
+
+  it("warns once when the value is set but invalid", async () => {
+    expect(await load("banana")).toHaveLength(1);
+    expect(await load("99999")).toHaveLength(1);
+  });
+
+  it("does not warn for a valid value or when unset", async () => {
+    expect(await load("330")).toHaveLength(0);
+    expect(await load("0")).toHaveLength(0);
+    expect(await load(undefined)).toHaveLength(0);
   });
 });

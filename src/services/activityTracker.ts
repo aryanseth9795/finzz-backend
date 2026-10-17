@@ -18,10 +18,19 @@ import {
  */
 
 /** Minutes to add to UTC to get the analytics calendar day (default IST). */
-export const ANALYTICS_TZ_OFFSET_MINUTES: number = process.env
-  .ANALYTICS_TZ_OFFSET_MINUTES
-  ? parseTzOffset(process.env.ANALYTICS_TZ_OFFSET_MINUTES)
-  : 330;
+export const ANALYTICS_TZ_OFFSET_MINUTES: number = (() => {
+  const raw = process.env.ANALYTICS_TZ_OFFSET_MINUTES;
+  if (!raw) return 330;
+  const n = Number(raw);
+  // Real offsets run from -12:00 to +14:00 (the same range parseTzOffset allows).
+  if (!Number.isFinite(n) || n < -720 || n > 840) {
+    console.warn(
+      `[activity] ANALYTICS_TZ_OFFSET_MINUTES="${raw}" is not a valid offset ` +
+        "(-720..840 minutes); using UTC (0).",
+    );
+  }
+  return parseTzOffset(raw);
+})();
 
 const MINUTE_MS = 60_000;
 const DAY_MS = 86_400_000;
@@ -140,11 +149,51 @@ const restoreTraffic = (entries: Map<string, TrafficEntry>): void => {
   }
 };
 
+/** Log flush failures at most once a minute so a DB outage cannot flood logs. */
+const FLUSH_LOG_INTERVAL_MS = 60_000;
+let lastFlushLogAt = 0;
+const logFlushError = (err: unknown): void => {
+  const nowMs = Date.now();
+  if (nowMs - lastFlushLogAt < FLUSH_LOG_INTERVAL_MS) return;
+  lastFlushLogAt = nowMs;
+  console.error("[activity] flush failed:", (err as Error)?.message);
+};
+
+/**
+ * Which ops of an unordered bulkWrite did NOT apply, given the thrown error.
+ * A MongoBulkWriteError reports exactly the failed ops in `writeErrors`; a
+ * writeConcernError on its own means every op was applied. Any other error
+ * (network, etc.) gives no such guarantee, so every op counts as failed.
+ */
+const failedOpIndexes = (err: unknown, total: number): Set<number> => {
+  const all = () => new Set(Array.from({ length: total }, (_, i) => i));
+  const e = err as {
+    name?: string;
+    writeErrors?: unknown;
+  };
+  if (!e || (e.name !== "MongoBulkWriteError" && e.writeErrors === undefined)) {
+    return all();
+  }
+  const list = Array.isArray(e.writeErrors)
+    ? e.writeErrors
+    : e.writeErrors
+      ? [e.writeErrors]
+      : [];
+  const failed = new Set<number>();
+  for (const w of list as Array<{ index?: number; err?: { index?: number } }>) {
+    const idx = w?.index ?? w?.err?.index;
+    // An error we cannot attribute to an op: retry everything to be safe.
+    if (typeof idx !== "number") return all();
+    failed.add(idx);
+  }
+  return failed;
+};
+
 /**
  * Write the buffered counts: one bulkWrite per model. On a write error the
- * counts are merged back into the buffer, so the next flush retries them.
- * Each model is restored independently so a failure in one cannot double count
- * the other.
+ * counts of the ops that did not apply are merged back into the buffer, so the
+ * next flush retries exactly those. Each model is restored independently so a
+ * failure in one cannot double count the other.
  */
 export async function flushActivity(): Promise<{
   activityRows: number;
@@ -155,21 +204,23 @@ export async function flushActivity(): Promise<{
   activityBuf = new Map();
   trafficBuf = new Map();
 
-  const activityOps = [...activity.values()]
-    .filter((e) => OBJECT_ID.test(e.user))
-    .map((e) => ({
-      updateOne: {
-        filter: { day: e.day, user: new mongoose.Types.ObjectId(e.user) },
-        update: {
-          $inc: { requests: e.requests, opens: e.opens },
-          $min: { firstSeenAt: new Date(e.first) },
-          $max: { lastSeenAt: new Date(e.last) },
-          $setOnInsert: { expiresAt: expiryOf(e.day) },
-        },
-        upsert: true,
+  const activityPairs = [...activity.entries()].filter(([, e]) =>
+    OBJECT_ID.test(e.user),
+  );
+  const activityOps = activityPairs.map(([, e]) => ({
+    updateOne: {
+      filter: { day: e.day, user: new mongoose.Types.ObjectId(e.user) },
+      update: {
+        $inc: { requests: e.requests, opens: e.opens },
+        $min: { firstSeenAt: new Date(e.first) },
+        $max: { lastSeenAt: new Date(e.last) },
+        $setOnInsert: { expiresAt: expiryOf(e.day) },
       },
-    }));
-  const trafficOps = [...traffic.values()].map((e) => ({
+      upsert: true,
+    },
+  }));
+  const trafficPairs = [...traffic.entries()];
+  const trafficOps = trafficPairs.map(([, e]) => ({
     updateOne: {
       filter: { day: e.day },
       update: {
@@ -188,8 +239,10 @@ export async function flushActivity(): Promise<{
       await DailyActivity.bulkWrite(activityOps, { ordered: false });
       activityRows = activityOps.length;
     } catch (err) {
-      console.error("[activity] flush failed:", (err as Error).message);
-      restoreActivity(activity);
+      logFlushError(err);
+      const failed = failedOpIndexes(err, activityOps.length);
+      activityRows = activityOps.length - failed.size;
+      restoreActivity(new Map(activityPairs.filter((_, i) => failed.has(i))));
     }
   }
   if (trafficOps.length > 0) {
@@ -197,8 +250,10 @@ export async function flushActivity(): Promise<{
       await DailyTraffic.bulkWrite(trafficOps, { ordered: false });
       trafficRows = trafficOps.length;
     } catch (err) {
-      console.error("[activity] flush failed:", (err as Error).message);
-      restoreTraffic(traffic);
+      logFlushError(err);
+      const failed = failedOpIndexes(err, trafficOps.length);
+      trafficRows = trafficOps.length - failed.size;
+      restoreTraffic(new Map(trafficPairs.filter((_, i) => failed.has(i))));
     }
   }
   return { activityRows, trafficRows };
@@ -207,9 +262,7 @@ export async function flushActivity(): Promise<{
 /** Flush on a timer. The timer is unref'd; returns a function that stops it. */
 export function startActivityFlush(intervalMs = 30_000): () => void {
   const timer = setInterval(() => {
-    flushActivity().catch((err) =>
-      console.error("[activity] flush failed:", (err as Error).message),
-    );
+    flushActivity().catch(logFlushError);
   }, intervalMs);
   timer.unref();
   return () => clearInterval(timer);
@@ -218,4 +271,5 @@ export function startActivityFlush(intervalMs = 30_000): () => void {
 export function _resetActivityBuffersForTests(): void {
   activityBuf = new Map();
   trafficBuf = new Map();
+  lastFlushLogAt = 0;
 }

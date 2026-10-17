@@ -231,3 +231,44 @@ describe("GET /admin/analytics/traffic", () => {
     expect(res.body.days[27].newUsers).toBe(0);
   });
 });
+
+describe("trackingSince", () => {
+  it("is null when no traffic has been recorded", async () => {
+    const cookie = await adminCookie();
+    const res = await request(app).get(URL).set("Cookie", cookie).expect(200);
+    expect(res.body.trackingSince).toBeNull();
+  });
+
+  it("is the earliest DailyTraffic.day, even outside the requested range", async () => {
+    const cookie = await adminCookie();
+    await seedTraffic(daysAgo(50), 5, 1);
+    await seedTraffic(daysAgo(10), 5, 1);
+    await seedTraffic(daysAgo(2), 5, 1);
+    const res = await request(app)
+      .get(`${URL}?days=7`)
+      .set("Cookie", cookie)
+      .expect(200);
+    expect(res.body.trackingSince).toBe(daysAgo(50));
+  });
+});
+
+describe("DELETE /admin/users/:id purges activity", () => {
+  it("removes the user's DailyActivity rows and leaves others", async () => {
+    const cookie = await adminCookie();
+    const victim = await registerUser(app);
+    const other = await registerUser(app);
+    const vid = new mongoose.Types.ObjectId(victim.id);
+    const otherId = new mongoose.Types.ObjectId(other.id);
+    await seedActivity(daysAgo(0), vid, 3, 1);
+    await seedActivity(daysAgo(1), vid, 2, 0);
+    await seedActivity(daysAgo(0), otherId, 4, 1);
+
+    await request(app)
+      .delete(`/api/v1/admin/users/${victim.id}`)
+      .set("Cookie", cookie)
+      .expect(200);
+
+    expect(await DailyActivity.countDocuments({ user: vid })).toBe(0);
+    expect(await DailyActivity.countDocuments({ user: otherId })).toBe(1);
+  });
+});
