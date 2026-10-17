@@ -1,15 +1,32 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+  vi,
+} from "vitest";
+import crypto from "crypto";
 import request from "supertest";
 import "./mailbox.js";
 import app from "../src/app.js";
 import { connect, disconnect, resetDb, syncIndexes } from "./helpers.js";
 import { AdminLoginGuard } from "../src/models/adminLoginGuardModel.js";
-import { validateAdminSecret } from "../src/config/envVariables.js";
+import {
+  validateAdminSecret,
+  wrongAdminCredentialMessage,
+} from "../src/config/envVariables.js";
 import {
   checkLock,
-  recordFailure,
+  reserveAttempt,
   recordSuccess,
+  guardKeyForIp,
 } from "../src/services/adminLoginGuard.js";
+
+/** A wrong guess: reserve the attempt and never match. */
+const recordFailure = (ip: string, now?: number) => reserveAttempt(ip, now);
 
 beforeAll(async () => {
   await connect();
@@ -75,6 +92,9 @@ describe("admin PIN login (HTTP)", () => {
     expect(fifth.body.message).toMatch(/^Too many attempts\. Try again in \d+ min$/);
     expect(fifth.body.retryAfterSeconds).toBeGreaterThan(14 * 60);
     expect(fifth.body.retryAfterSeconds).toBeLessThanOrEqual(15 * 60);
+    expect(Number(fifth.headers["retry-after"])).toBe(
+      fifth.body.retryAfterSeconds,
+    );
 
     const correct = await login(PIN).expect(429);
     expect(correct.headers["set-cookie"]).toBeUndefined();
@@ -153,6 +173,7 @@ describe("adminLoginGuard service", () => {
     await AdminLoginGuard.create({
       key: "ip:4.4.4.4",
       failures: 4,
+      windowStart: new Date(t),
       lockCount: 20,
       expiresAt: new Date(t + 7 * 24 * 60 * MIN),
     });
@@ -200,7 +221,11 @@ describe("adminLoginGuard service", () => {
 describe("validateAdminSecret", () => {
   it("accepts a 6-character alphanumeric PIN", () => {
     expect(validateAdminSecret("A1b2C3", true)).toEqual({ ok: true, kind: "pin" });
-    expect(validateAdminSecret("123456", false)).toEqual({ ok: true, kind: "pin" });
+    expect(validateAdminSecret("123456", false)).toEqual({
+      ok: true,
+      kind: "pin",
+      weak: true,
+    });
   });
 
   it("accepts a 24+ character legacy secret", () => {
@@ -227,5 +252,222 @@ describe("validateAdminSecret", () => {
   it("rejects a 6-character value that is not alphanumeric", () => {
     expect(validateAdminSecret("12345!", true).ok).toBe(false);
     expect(validateAdminSecret("12 456", true).ok).toBe(false);
+  });
+});
+
+describe("reserve-before-compare (concurrency)", () => {
+  let compares: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    compares = vi.spyOn(crypto, "timingSafeEqual");
+  });
+  afterEach(() => {
+    compares.mockRestore();
+  });
+
+  it("120 concurrent wrong guesses from 120 IPs → at most 30 compares, the rest 429", async () => {
+    const ips = Array.from({ length: 120 }, (_, i) => `10.50.0.${i + 1}`);
+    const responses = await Promise.all(ips.map((ip) => login("ZZZZZZ", ip)));
+    expect(compares.mock.calls.length).toBeLessThanOrEqual(30);
+    const wrong = responses.filter((r) => r.status === 401).length;
+    const locked = responses.filter((r) => r.status === 429).length;
+    expect(wrong + locked).toBe(120);
+    expect(wrong).toBeLessThanOrEqual(30);
+    expect(locked).toBeGreaterThanOrEqual(90);
+  });
+
+  it("10 concurrent wrong guesses from one IP → at most 5 compares", async () => {
+    const ip = "10.51.0.1";
+    const responses = await Promise.all(
+      Array.from({ length: 10 }, () => login("ZZZZZZ", ip)),
+    );
+    expect(compares.mock.calls.length).toBeLessThanOrEqual(5);
+    expect(responses.filter((r) => r.status === 401).length).toBeLessThanOrEqual(4);
+    expect(responses.filter((r) => r.status === 429).length).toBeGreaterThanOrEqual(6);
+    // The lock was applied exactly once.
+    const doc = await AdminLoginGuard.findOne({ key: guardKeyForIp(ip) }).lean();
+    expect(doc!.lockCount).toBe(1);
+  });
+
+  it("a refused attempt never compares, even with the correct PIN", async () => {
+    for (let i = 0; i < 5; i++) await login("ZZZZZZ", "10.52.0.1");
+    compares.mockClear();
+    await login(PIN, "10.52.0.1").expect(429);
+    expect(compares).not.toHaveBeenCalled();
+  });
+
+  it("a correct login gives its global reservation back", async () => {
+    await login("ZZZZZZ", "10.53.0.1").expect(401);
+    await login(PIN, "10.53.0.2").expect(200);
+    const g = await AdminLoginGuard.findOne({ key: "global" }).lean();
+    expect(g!.failures).toBe(1);
+  });
+});
+
+describe("global lock escalation", () => {
+  const trip = async (t: number, tag: string) => {
+    let last;
+    for (let i = 0; i < 30; i++) last = await reserveAttempt(`${tag}.${i}`, t);
+    return last!;
+  };
+
+  it("doubles each time: 30 min, 60 min, 120 min", async () => {
+    const t0 = Date.now();
+    expect((await trip(t0, "20.0.0")).retryAfterSeconds).toBe(30 * 60);
+    const t1 = t0 + 31 * MIN;
+    expect((await trip(t1, "20.0.1")).retryAfterSeconds).toBe(60 * 60);
+    const t2 = t1 + 61 * MIN;
+    expect((await trip(t2, "20.0.2")).retryAfterSeconds).toBe(120 * 60);
+    const g = await AdminLoginGuard.findOne({ key: "global" }).lean();
+    expect(g!.lockCount).toBe(3);
+  });
+
+  it("is capped at 24 hours", async () => {
+    const t = Date.now();
+    await AdminLoginGuard.create({
+      key: "global",
+      failures: 29,
+      windowStart: new Date(t),
+      lockCount: 10,
+      expiresAt: new Date(t + 7 * 24 * 60 * MIN),
+    });
+    const r = await reserveAttempt("20.1.0.1", t);
+    expect(r.locked).toBe(true);
+    expect(r.retryAfterSeconds).toBe(24 * 60 * 60);
+  });
+
+  it("decays back to 30 min after 24 h without a global lock", async () => {
+    const t0 = Date.now();
+    await trip(t0, "20.2.0");
+    await trip(t0 + 31 * MIN, "20.2.1"); // second lock: 60 min
+    const lastLockEnd = t0 + 31 * MIN + 60 * MIN;
+    const later = lastLockEnd + 25 * 60 * MIN;
+    expect((await trip(later, "20.2.2")).retryAfterSeconds).toBe(30 * 60);
+    const g = await AdminLoginGuard.findOne({ key: "global" }).lean();
+    expect(g!.lockCount).toBe(1);
+  });
+
+  it("does not decay when the last lock ended less than 24 h ago", async () => {
+    const t0 = Date.now();
+    await trip(t0, "20.3.0");
+    const soon = t0 + 30 * MIN + 23 * 60 * MIN;
+    expect((await trip(soon, "20.3.1")).retryAfterSeconds).toBe(60 * 60);
+  });
+});
+
+describe("per-IP rolling window", () => {
+  it("failures older than 1 hour no longer count towards the lock", async () => {
+    const t = Date.now();
+    for (let i = 0; i < 4; i++) await reserveAttempt("21.0.0.1", t);
+    const later = t + 61 * MIN;
+    const r = await reserveAttempt("21.0.0.1", later);
+    expect(r.locked).toBe(false);
+    expect(r.attemptsLeft).toBe(4);
+  });
+
+  it("failures inside the hour still add up", async () => {
+    const t = Date.now();
+    for (let i = 0; i < 4; i++)
+      await reserveAttempt("21.0.0.2", t + i * 10 * MIN);
+    const r = await reserveAttempt("21.0.0.2", t + 50 * MIN);
+    expect(r.locked).toBe(true);
+  });
+});
+
+describe("IPv6 bucketing", () => {
+  it("addresses in the same subnet share one key", () => {
+    expect(guardKeyForIp("2001:db8::1")).toBe(guardKeyForIp("2001:db8::6"));
+    expect(guardKeyForIp("2001:db8::1")).not.toBe(guardKeyForIp("2001:db9::1"));
+    expect(guardKeyForIp("10.0.0.1")).not.toBe(guardKeyForIp("10.0.0.2"));
+  });
+
+  it("five guesses spread over one v6 subnet lock that subnet", async () => {
+    const t = Date.now();
+    let last;
+    for (let i = 1; i <= 5; i++) last = await reserveAttempt(`2001:db8::${i}`, t);
+    expect(last!.locked).toBe(true);
+    expect((await checkLock("2001:db8::ff", t)).locked).toBe(true);
+    expect((await checkLock("2001:db9::1", t)).locked).toBe(false);
+  });
+});
+
+describe("operator visibility", () => {
+  it("warns with the IP and duration when an IP lock trips, never the input", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (let i = 0; i < 5; i++) await login("HUNTER2", "10.60.0.9");
+      const lines = warn.mock.calls.map((c) => c.join(" "));
+      const tripped = lines.find((l) => l.includes("10.60.0.9"));
+      expect(tripped).toBeTruthy();
+      expect(tripped).toMatch(/15 min/);
+      expect(lines.join("\n")).not.toMatch(/HUNTER2/i);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("warns when the global lock trips", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (let i = 0; i < 30; i++) await reserveAttempt(`10.61.0.${i}`);
+      const lines = warn.mock.calls.map((c) => c.join(" "));
+      expect(
+        lines.some(
+          (l) => /global/i.test(l) && /30 min/.test(l) && l.includes("10.61.0.29"),
+        ),
+      ).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("ADMIN_LOGIN_ALLOWLIST_IPS", () => {
+  afterEach(() => {
+    delete process.env.ADMIN_LOGIN_ALLOWLIST_IPS;
+  });
+
+  it("skips the global lock but never the per-IP lock", async () => {
+    process.env.ADMIN_LOGIN_ALLOWLIST_IPS = " 10.70.0.1 , 10.70.0.2";
+    const t = Date.now();
+    for (let i = 0; i < 30; i++) await reserveAttempt(`10.71.0.${i}`, t);
+    // Everyone else is paused...
+    expect((await reserveAttempt("10.71.9.9", t + MIN)).allowed).toBe(false);
+    // ...but the allowlisted address still gets to try.
+    const ok = await reserveAttempt("10.70.0.1", t + MIN);
+    expect(ok.allowed).toBe(true);
+    expect(ok.locked).toBe(false);
+    // Its own per-IP lock still applies.
+    let last = ok;
+    for (let i = 0; i < 4; i++) last = await reserveAttempt("10.70.0.1", t + MIN);
+    expect(last.locked).toBe(true);
+    expect((await reserveAttempt("10.70.0.1", t + 2 * MIN)).allowed).toBe(false);
+  });
+
+  it("allowlisted attempts do not count towards the global lock", async () => {
+    process.env.ADMIN_LOGIN_ALLOWLIST_IPS = "10.72.0.1";
+    await reserveAttempt("10.72.0.1");
+    expect(await AdminLoginGuard.findOne({ key: "global" }).lean()).toBeNull();
+  });
+});
+
+describe("credential wording", () => {
+  it("names the PIN in PIN mode and the secret key in secret mode", () => {
+    expect(wrongAdminCredentialMessage("pin")).toBe("Wrong PIN");
+    expect(wrongAdminCredentialMessage("secret")).toBe("Wrong secret key");
+  });
+});
+
+describe("digits-only PIN", () => {
+  it("is flagged weak; alphanumeric PINs and long secrets are not", () => {
+    expect(validateAdminSecret("123456", true)).toEqual({
+      ok: true,
+      kind: "pin",
+      weak: true,
+    });
+    expect(validateAdminSecret("12345A", true)).toEqual({ ok: true, kind: "pin" });
+    expect(validateAdminSecret("1".repeat(24), true)).toEqual({
+      ok: true,
+      kind: "secret",
+    });
   });
 });

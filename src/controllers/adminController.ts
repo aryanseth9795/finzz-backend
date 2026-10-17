@@ -13,7 +13,11 @@ import { MonthlySummary } from "../models/monthlySummaryModel.js";
 import { Notification } from "../models/notificationModel.js";
 import { Note } from "../models/noteModel.js";
 import ErrorHandler from "../middlewares/Errorhandler.js";
-import { adminSecretKey } from "../config/envVariables.js";
+import {
+  adminSecretKey,
+  adminSecretKind,
+  wrongAdminCredentialMessage,
+} from "../config/envVariables.js";
 import { signAdminToken } from "../utils/tokens.js";
 import { buildSearchRegex } from "../utils/escapeRegex.js";
 import {
@@ -22,8 +26,7 @@ import {
 } from "../services/notificationService.js";
 import { PoolTx } from "../models/poolTxModel.js";
 import {
-  checkLock,
-  recordFailure,
+  reserveAttempt,
   recordSuccess,
 } from "../services/adminLoginGuard.js";
 
@@ -69,29 +72,35 @@ const adminSecretMatches = (provided: string): boolean => {
 };
 
 const sendLocked = (res: Response, retryAfterSeconds: number) =>
-  void res.status(429).json({
-    success: false,
-    message: `Too many attempts. Try again in ${Math.max(1, Math.ceil(retryAfterSeconds / 60))} min`,
-    retryAfterSeconds,
-  });
+  void res
+    .status(429)
+    .set("Retry-After", String(Math.max(1, Math.ceil(retryAfterSeconds))))
+    .json({
+      success: false,
+      message: `Too many attempts. Try again in ${Math.max(1, Math.ceil(retryAfterSeconds / 60))} min`,
+      retryAfterSeconds,
+    });
 
 export const adminLogin = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { secretKey } = req.body;
     const ip = req.ip ?? "unknown";
 
-    // Refuse before comparing anything: while locked, even the correct PIN is
-    // rejected, so a lock cannot be probed for the answer.
-    const lock = await checkLock(ip);
-    if (lock.locked) return sendLocked(res, lock.retryAfterSeconds);
+    // Reserve the attempt BEFORE comparing. The reservation is atomic, so with
+    // many guesses in flight only the permitted number is ever compared; a
+    // refused attempt (even with the correct PIN) is never looked at, so a
+    // lock cannot be probed for the answer.
+    const attempt = await reserveAttempt(ip);
+    if (!attempt.allowed) return sendLocked(res, attempt.retryAfterSeconds);
 
     if (!adminSecretMatches(String(secretKey ?? ""))) {
-      const failure = await recordFailure(ip);
-      if (failure.locked) return sendLocked(res, failure.retryAfterSeconds);
+      // The attempt is already counted. If it was the last permitted one the
+      // lock is now in force and the caller is told so.
+      if (attempt.locked) return sendLocked(res, attempt.retryAfterSeconds);
       return void res.status(401).json({
         success: false,
-        message: "Wrong PIN",
-        attemptsLeft: failure.attemptsLeft,
+        message: wrongAdminCredentialMessage(adminSecretKind),
+        attemptsLeft: attempt.attemptsLeft,
       });
     }
 

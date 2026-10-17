@@ -59,9 +59,15 @@ export const validateAdminSecret = (
   value: string,
   isProduction: boolean,
 ):
-  | { ok: true; kind: "pin" | "secret" }
+  | { ok: true; kind: "pin"; weak?: true }
+  | { ok: true; kind: "secret" }
   | { ok: false; message: string } => {
-  if (/^[A-Za-z0-9]{6}$/.test(value)) return { ok: true, kind: "pin" };
+  if (/^[A-Za-z0-9]{6}$/.test(value)) {
+    // A digits-only PIN has just 10^6 combinations.
+    return /^[0-9]{6}$/.test(value)
+      ? { ok: true, kind: "pin", weak: true }
+      : { ok: true, kind: "pin" };
+  }
   if (value.length >= 24) return { ok: true, kind: "secret" };
   return {
     ok: false,
@@ -77,7 +83,24 @@ const adminSecretCheck = validateAdminSecret(adminSecretKey, isProduction);
 if (!adminSecretCheck.ok) {
   if (isProduction) throw new Error(adminSecretCheck.message);
   console.warn(`[config] WARNING: ${adminSecretCheck.message}`);
+} else if (adminSecretCheck.kind === "pin" && adminSecretCheck.weak) {
+  console.warn(
+    "[config] WARNING: ADMIN_SECRET_KEY is a digits-only PIN: only 10^6 " +
+      "combinations. The login lockout makes this workable, but an " +
+      "alphanumeric PIN (36^6 combinations) is much stronger.",
+  );
 }
+
+/** Which credential the admin login expects; drives the wording of errors. */
+const adminSecretKind: "pin" | "secret" = /^[A-Za-z0-9]{6}$/.test(
+  adminSecretKey,
+)
+  ? "pin"
+  : "secret";
+
+/** 401 message for a wrong admin credential, named after the active mode. */
+export const wrongAdminCredentialMessage = (kind: "pin" | "secret"): string =>
+  kind === "pin" ? "Wrong PIN" : "Wrong secret key";
 
 // ── Token lifetimes ────────────────────────────────────────────────────────
 // Access tokens are short-lived because they are replayable until they expire.
@@ -151,6 +174,7 @@ export {
   ADMIN_TOKEN_EXPIRES_IN,
   COOKIE_EXPIRES_IN,
   adminSecretKey,
+  adminSecretKind,
   MongoURL,
   RESEND_API_KEY,
   MAIL_TRANSPORT,
