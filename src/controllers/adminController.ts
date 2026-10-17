@@ -21,6 +21,11 @@ import {
   sendBulkPushNotifications,
 } from "../services/notificationService.js";
 import { PoolTx } from "../models/poolTxModel.js";
+import {
+  checkLock,
+  recordFailure,
+  recordSuccess,
+} from "../services/adminLoginGuard.js";
 
 /**
  * Cookie options for the admin session.
@@ -41,25 +46,56 @@ const ADMIN_COOKIE_OPTIONS = {
 };
 
 // ==========================================
-// Admin Login (secret key)
+// Admin Login (6-character PIN, or legacy long secret)
 // ==========================================
+const sha256 = (value: string) =>
+  crypto.createHash("sha256").update(value, "utf8").digest();
+
+/** Upper-case ASCII letters only, so non-ASCII case folding (e.g. "ß") can't alias. */
+const asciiUpper = (value: string) =>
+  value.replace(/[a-z]/g, (c) => c.toUpperCase());
+
+/**
+ * Compare in constant time. Both sides are hashed first so the buffers are
+ * always 32 bytes: `timingSafeEqual` needs equal lengths, and hashing avoids
+ * leaking the secret's length through an early length check. A PIN is compared
+ * case-insensitively; the legacy long secret exactly.
+ */
+const adminSecretMatches = (provided: string): boolean => {
+  const isPin = /^[A-Za-z0-9]{6}$/.test(adminSecretKey);
+  const a = isPin ? asciiUpper(provided) : provided;
+  const b = isPin ? asciiUpper(adminSecretKey) : adminSecretKey;
+  return crypto.timingSafeEqual(sha256(a), sha256(b));
+};
+
+const sendLocked = (res: Response, retryAfterSeconds: number) =>
+  void res.status(429).json({
+    success: false,
+    message: `Too many attempts. Try again in ${Math.max(1, Math.ceil(retryAfterSeconds / 60))} min`,
+    retryAfterSeconds,
+  });
+
 export const adminLogin = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { secretKey } = req.body;
+    const ip = req.ip ?? "unknown";
 
-    // Compare in constant time. A plain `!==` returns as soon as it finds a
-    // differing byte, so response timing leaks a prefix-match oracle that turns
-    // an exponential guess into a linear one.
-    const provided = Buffer.from(String(secretKey ?? ""), "utf8");
-    const expected = Buffer.from(adminSecretKey, "utf8");
-    const matches =
-      provided.length === expected.length &&
-      crypto.timingSafeEqual(provided, expected);
+    // Refuse before comparing anything: while locked, even the correct PIN is
+    // rejected, so a lock cannot be probed for the answer.
+    const lock = await checkLock(ip);
+    if (lock.locked) return sendLocked(res, lock.retryAfterSeconds);
 
-    if (!matches) {
-      return next(new ErrorHandler("Invalid admin secret key", 401));
+    if (!adminSecretMatches(String(secretKey ?? ""))) {
+      const failure = await recordFailure(ip);
+      if (failure.locked) return sendLocked(res, failure.retryAfterSeconds);
+      return void res.status(401).json({
+        success: false,
+        message: "Wrong PIN",
+        attemptsLeft: failure.attemptsLeft,
+      });
     }
 
+    await recordSuccess(ip);
     const token = signAdminToken();
 
     res

@@ -48,12 +48,35 @@ if (JWT_SECRET.length < 32) {
   console.warn(`[config] WARNING: ${message}`);
 }
 
-if (adminSecretKey.length < 24) {
-  const message =
-    `ADMIN_SECRET_KEY is ${adminSecretKey.length} characters; at least 24 is required. ` +
-    `It is the single credential guarding every admin action.`;
-  if (isProduction) throw new Error(message);
-  console.warn(`[config] WARNING: ${message}`);
+/**
+ * ADMIN_SECRET_KEY is either:
+ *  - a 6-character PIN of letters/digits (safe only because admin login is
+ *    protected by a persistent per-IP and global lockout), or
+ *  - the legacy long secret of 24+ characters.
+ * Anything else is rejected.
+ */
+export const validateAdminSecret = (
+  value: string,
+  isProduction: boolean,
+):
+  | { ok: true; kind: "pin" | "secret" }
+  | { ok: false; message: string } => {
+  if (/^[A-Za-z0-9]{6}$/.test(value)) return { ok: true, kind: "pin" };
+  if (value.length >= 24) return { ok: true, kind: "secret" };
+  return {
+    ok: false,
+    message:
+      `ADMIN_SECRET_KEY is ${value.length} characters and is not a valid PIN; ` +
+      `it must be exactly 6 letters/digits (a PIN) or at least 24 characters. ` +
+      `It is the single credential guarding every admin action.` +
+      (isProduction ? "" : " (allowed in development only)"),
+  };
+};
+
+const adminSecretCheck = validateAdminSecret(adminSecretKey, isProduction);
+if (!adminSecretCheck.ok) {
+  if (isProduction) throw new Error(adminSecretCheck.message);
+  console.warn(`[config] WARNING: ${adminSecretCheck.message}`);
 }
 
 // ── Token lifetimes ────────────────────────────────────────────────────────
