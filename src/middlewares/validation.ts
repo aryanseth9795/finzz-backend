@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { Request, Response, NextFunction } from "express";
 import { compareVersions } from "../utils/semver.js";
+import { MAX_SEARCH_LENGTH } from "../utils/escapeRegex.js";
+import { NOTE_BODY_MAX, NOTE_TITLE_MAX } from "../models/noteModel.js";
 
 //======= Shared primitives =======//
 //
@@ -549,4 +551,56 @@ export const appReleaseSchema = z.object({
         path: ["minSupportedVersion"],
       },
     ),
+});
+
+//======= Notes =======//
+
+const noteTitle = shortText(NOTE_TITLE_MAX, "Title");
+const noteBody = z
+  .string()
+  .max(NOTE_BODY_MAX, `Note must be ${NOTE_BODY_MAX} characters or fewer`);
+
+export const createNoteSchema = z.object({
+  body: z.object({
+    title: noteTitle.optional(),
+    body: noteBody.optional(),
+    personLabel: objectId.nullable().optional(),
+  }),
+});
+
+export const listNotesSchema = z.object({
+  query: z.object({
+    scope: z.enum(["all", "mine", "shared"]).default("all"),
+    label: z.union([objectId, z.literal("none")]).optional(),
+    q: z
+      .string()
+      .trim()
+      .max(MAX_SEARCH_LENGTH, `Search must be ${MAX_SEARCH_LENGTH} characters or fewer`)
+      .optional(),
+    cursor: z.string().max(120).optional(),
+    limit: z.coerce.number().int().min(1).max(50).default(20),
+  }),
+});
+
+export const noteIdParamSchema = z.object({
+  params: z.object({ noteId: objectId }),
+});
+
+export const updateNoteSchema = z.object({
+  params: z.object({ noteId: objectId }),
+  body: z
+    .object({
+      title: noteTitle.optional(),
+      body: noteBody.optional(),
+      version: z.number().int().min(1),
+    })
+    .refine((b) => b.title !== undefined || b.body !== undefined, {
+      message: "Nothing to update",
+      path: ["body"],
+    }),
+});
+
+export const noteLabelSchema = z.object({
+  params: z.object({ noteId: objectId }),
+  body: z.object({ personLabel: objectId.nullable() }),
 });

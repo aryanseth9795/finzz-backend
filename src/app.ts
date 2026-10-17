@@ -14,6 +14,7 @@ import expenseRoutes from "./routes/expenseRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
 import notificationRoutes from "./routes/notificationRoutes.js";
 import appRoutes from "./routes/appRoutes.js";
+import noteRoutes from "./routes/noteRoutes.js";
 
 import { CLIENT_ORIGINS } from "./config/envVariables.js";
 import { apiLimiter } from "./middlewares/rateLimit.js";
@@ -79,6 +80,7 @@ app.use("/api/v1/expenses", expenseRoutes);
 app.use("/api/v1/admin", adminRoutes);
 app.use("/api/v1/notifications", notificationRoutes);
 app.use("/api/v1/app", appRoutes);
+app.use("/api/v1/notes", noteRoutes);
 
 // Unknown route → JSON 404. Previously an unmatched path fell through to
 // Express's HTML error page, which clients parsing JSON could not read.
