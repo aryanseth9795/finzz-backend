@@ -9,6 +9,7 @@ import {
   isProduction,
 } from "./src/config/envVariables.js";
 import connectDb from "./src/db/db.js";
+import { processPushReceipts } from "./src/services/pushReceipts.js";
 
 /**
  * Process bootstrap. The Express application itself lives in `src/app.ts` and
@@ -46,11 +47,30 @@ const startKeepAlive = () => {
   pingTimer.unref();
 };
 
+/**
+ * Fetch Expo push receipts every 10 minutes so delivery failures (bad FCM
+ * credentials, dead tokens) are recorded and dead tokens pruned. Never throws.
+ */
+let receiptTimer: NodeJS.Timeout | undefined;
+
+const startReceiptChecks = () => {
+  receiptTimer = setInterval(
+    () => {
+      processPushReceipts().catch((error) =>
+        console.error("[push-receipts] run failed:", error),
+      );
+    },
+    10 * 60 * 1000,
+  );
+  receiptTimer.unref();
+};
+
 const start = async () => {
   // Previously `connectDb(...)` was called without `await`, so the server began
   // accepting requests before the database was reachable — early requests
   // failed with confusing errors instead of the process failing loudly.
   await connectDb(MongoURL);
+  startReceiptChecks();
 
   const server = app.listen(PORT, () => {
     console.log(
@@ -67,6 +87,7 @@ const start = async () => {
   const shutdown = async (signal: string) => {
     console.log(`[shutdown] ${signal} received, closing gracefully…`);
     if (pingTimer) clearInterval(pingTimer);
+    if (receiptTimer) clearInterval(receiptTimer);
 
     server.close(async () => {
       try {

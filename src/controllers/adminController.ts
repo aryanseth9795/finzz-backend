@@ -21,6 +21,10 @@ import {
   broadcastPushNotification,
   sendBulkPushNotifications,
 } from "../services/notificationService.js";
+import {
+  processPushReceipts,
+  recentDeliveryStats,
+} from "../services/pushReceipts.js";
 import { PoolTx } from "../models/poolTxModel.js";
 
 /**
@@ -699,8 +703,8 @@ export const sendBulkNotification = TryCatch(
     res.status(200).json({
       success: true,
       message:
-        `Delivered to ${report.accepted} device(s) across ${report.recipients} user(s); ` +
-        `${report.rejected} rejected.`,
+        `Queued ${report.accepted} notification(s) at Expo. ` +
+        `Delivery is confirmed by receipts about 15 minutes later — see Delivery health.`,
       // Three distinct numbers, because they mean three different things.
       // `sentCount` previously counted messages *submitted* to Expo and was
       // reported to the operator as a delivery count.
@@ -767,6 +771,11 @@ export const sendTargetedNotification = TryCatch(
         })),
       );
 
+      if (report.error) {
+        console.error("[admin] sendTargetedNotification send failed:", report.error);
+        return next(new ErrorHandler("Failed to send the notification", 500));
+      }
+
       let message = `Sent to ${report.accepted} device(s)`;
       if (report.rejected > 0) message += `; ${report.rejected} rejected`;
       if (report.skipped > 0) {
@@ -787,5 +796,35 @@ export const sendTargetedNotification = TryCatch(
       console.error("[admin] sendTargetedNotification failed:", error);
       return next(new ErrorHandler("Failed to send the notification", 500));
     }
+  },
+);
+
+// ==========================================
+// Push delivery health (last 24h)
+// ==========================================
+export const getNotificationHealth = TryCatch(
+  async (req: Request, res: Response) => {
+    if (req.query.check === "1") {
+      await processPushReceipts({ olderThanMs: 0 });
+    }
+
+    const last24h = await recentDeliveryStats();
+    const codes = Object.keys(last24h.errors);
+
+    let hint: string | null = null;
+    if (
+      codes.includes("InvalidCredentials") ||
+      codes.includes("MismatchSenderId")
+    ) {
+      hint =
+        "Expo can't deliver to Android: the FCM V1 credential for this app is missing or belongs to another Firebase project. Upload the Firebase service-account key for project finzz-1e22b with `eas credentials` (Android → Push Notifications: FCM V1).";
+    } else if (codes.length > 0 && codes.every((c) => c === "DeviceNotRegistered")) {
+      hint =
+        "Some devices uninstalled the app or changed tokens; they were removed automatically.";
+    } else if (last24h.total === 0) {
+      hint = "No pushes were sent in the last 24 hours.";
+    }
+
+    res.status(200).json({ success: true, last24h, hint });
   },
 );

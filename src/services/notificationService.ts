@@ -13,6 +13,8 @@ export interface DeliveryReport {
   rejected: number;
   /** Recipients that had no usable push token at all. */
   skipped: number;
+  /** Set when the send path itself failed (not merely a rejected message). */
+  error?: string;
 }
 
 /**
@@ -256,7 +258,12 @@ export async function sendBulkPushNotifications(
     return { accepted, rejected, skipped };
   } catch (error) {
     console.error("[push] sendBulkPushNotifications failed:", errorMessage(error));
-    return { accepted: 0, rejected: 0, skipped: notifications.length };
+    return {
+      accepted: 0,
+      rejected: 0,
+      skipped: notifications.length,
+      error: errorMessage(error),
+    };
   }
 }
 
