@@ -278,19 +278,23 @@ export function weekdayStripSvg(data: ChatReportData): string {
 export function trendBarsSvg(data: ChatReportData): string {
   const W = 640;
   const H = 160;
-  const label = `Net movement per month, last ${data.trend.length} months`;
+  const title = `Change in what ${data.friend.name} owes you`;
+  const label = `${title}, last ${data.trend.length} months`;
 
+  // trend[].net is received - gave, which LOWERS the balance when positive. The
+  // chart plots the balance change itself (gave - received = -net): a month where
+  // the viewer gave more is a positive, green "+" bar above the zero line.
   const trend = data.trend;
-  const nets = trend.map((m) => (Number.isFinite(m.net) ? m.net : 0));
-  if (trend.length === 0 || nets.every((v) => v === 0)) return emptySvg(W, H, label);
+  const changes = trend.map((m) => (Number.isFinite(m.net) && m.net !== 0 ? -m.net : 0));
+  if (trend.length === 0 || changes.every((v) => v === 0)) return emptySvg(W, H, label);
 
   const L = 24;
   const R = 616;
   const T = 26;
   const B = 120;
   const plotH = B - T;
-  const maxPos = Math.max(...nets, 0);
-  const maxNeg = Math.max(...nets.map((v) => -v), 0);
+  const maxPos = Math.max(...changes, 0);
+  const maxNeg = Math.max(...changes.map((v) => -v), 0);
   const range = Math.max(maxPos + maxNeg, 1);
   const zeroY = T + (maxPos / range) * plotH;
   const perUnit = plotH / range;
@@ -299,31 +303,32 @@ export function trendBarsSvg(data: ChatReportData): string {
   const bw = Math.min(slot * 0.55, 56);
 
   const parts: string[] = [
+    text(L, 11, title, { anchor: "start", size: 11, fill: "#334155" }),
     `<line data-role="zero" x1="${L}" y1="${n(zeroY)}" x2="${R}" y2="${n(
       zeroY,
     )}" stroke="${CHART_COLORS.grid}" stroke-width="1"/>`,
   ];
 
   trend.forEach((m, i) => {
-    const net = nets[i];
+    const change = changes[i];
     const cx = L + slot * (i + 0.5);
-    const barH = net === 0 ? 0 : Math.max(Math.abs(net) * perUnit, 1);
-    if (net > 0) {
+    const barH = change === 0 ? 0 : Math.max(Math.abs(change) * perUnit, 1);
+    if (change > 0) {
       const top = Math.max(zeroY - barH, T);
       parts.push(
         `<rect x="${n(cx - bw / 2)}" y="${n(top)}" width="${n(bw)}" height="${n(
           zeroY - top,
         )}" rx="2" fill="${CHART_COLORS.positive}"/>`,
       );
-      parts.push(text(cx, top - 4, abbrev(net, true), { size: 10, fill: CHART_COLORS.positive }));
-    } else if (net < 0) {
+      parts.push(text(cx, top - 4, abbrev(change, true), { size: 10, fill: CHART_COLORS.positive }));
+    } else if (change < 0) {
       const bottom = Math.min(zeroY + barH, B);
       parts.push(
         `<rect x="${n(cx - bw / 2)}" y="${n(zeroY)}" width="${n(bw)}" height="${n(
           bottom - zeroY,
         )}" rx="2" fill="${CHART_COLORS.negative}"/>`,
       );
-      parts.push(text(cx, bottom + 12, abbrev(net, true), { size: 10, fill: CHART_COLORS.negative }));
+      parts.push(text(cx, bottom + 12, abbrev(change, true), { size: 10, fill: CHART_COLORS.negative }));
     } else {
       parts.push(text(cx, zeroY - 4, abbrev(0), { size: 10 }));
     }

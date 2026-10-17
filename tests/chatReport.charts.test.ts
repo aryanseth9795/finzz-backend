@@ -352,7 +352,49 @@ describe("weekdayStripSvg", () => {
 });
 
 describe("trendBarsSvg", () => {
-  it("puts a negative-net bar below the zero line and a positive one above it", () => {
+  // trend[].net = received - gave. The chart plots the balance change = gave - received = -net,
+  // so a month where the viewer gave more is a POSITIVE (green, "+") bar above the zero line.
+  it("draws a month where the viewer gave more as a positive green bar above the zero line", () => {
+    const svg = trendBarsSvg(
+      makeData({
+        trend: [
+          { year: 2026, month: 9, label: "Sep", gave: 100, received: 100, net: 0 },
+          { year: 2026, month: 10, label: "Oct", gave: 700, received: 100, net: -600 },
+        ],
+      }),
+    );
+    const zero = tagsOf(svg, "line").find((t) => t.includes('data-role="zero"'))!;
+    const zeroY = attr(zero, "y1")!;
+    const rects = tagsOf(svg, "rect");
+    expect(rects).toHaveLength(1);
+    expect(rects[0]).toContain(`fill="${CHART_COLORS.positive}"`);
+    expect(attr(rects[0], "y")! + attr(rects[0], "height")!).toBeLessThanOrEqual(zeroY + 0.05);
+    expect(svg).toContain("+₹600");
+    expect(svg).not.toContain("-₹600");
+  });
+
+  it("draws a month where the viewer received more as a negative bar below the zero line", () => {
+    const svg = trendBarsSvg(
+      makeData({
+        trend: [{ year: 2026, month: 10, label: "Oct", gave: 50, received: 900, net: 850 }],
+      }),
+    );
+    const zeroY = attr(tagsOf(svg, "line").find((t) => t.includes('data-role="zero"'))!, "y1")!;
+    const rects = tagsOf(svg, "rect");
+    expect(rects).toHaveLength(1);
+    expect(rects[0]).toContain(`fill="${CHART_COLORS.negative}"`);
+    expect(attr(rects[0], "y")!).toBeGreaterThanOrEqual(zeroY - 0.05);
+    expect(svg).toContain("-₹850");
+  });
+
+  it("is titled 'Change in what <friend> owes you'", () => {
+    const svg = trendBarsSvg(active());
+    expect(svg).toContain("Change in what Summer owes you");
+    expect(svg).not.toContain("Net movement");
+    expect(svg).toContain(">Change in what Summer owes you<");
+  });
+
+  it("puts a gave-more month above the zero line and a received-more month below it", () => {
     const svg = trendBarsSvg(active());
     const zero = tagsOf(svg, "line").find((t) => t.includes('data-role="zero"'));
     expect(zero).toBeDefined();
@@ -360,8 +402,9 @@ describe("trendBarsSvg", () => {
     const rects = tagsOf(svg, "rect");
     const neg = rects.filter((t) => t.includes(`fill="${CHART_COLORS.negative}"`));
     const pos = rects.filter((t) => t.includes(`fill="${CHART_COLORS.positive}"`));
-    expect(neg).toHaveLength(3);
-    expect(pos).toHaveLength(2);
+    // May, Jul, Oct: net < 0 (gave more) -> positive. Jun, Sep: net > 0 -> negative.
+    expect(pos).toHaveLength(3);
+    expect(neg).toHaveLength(2);
     for (const t of neg) expect(attr(t, "y")!).toBeGreaterThanOrEqual(zeroY - 0.05);
     for (const t of pos) {
       expect(attr(t, "y")! + attr(t, "height")!).toBeLessThanOrEqual(zeroY + 0.05);
@@ -373,8 +416,8 @@ describe("trendBarsSvg", () => {
     for (const m of ["May", "Jun", "Jul", "Aug", "Sep", "Oct"]) {
       expect(svg).toContain(`>${m}<`);
     }
-    expect(svg).toContain("+₹850");
-    expect(svg).toContain("-₹600");
+    expect(svg).toContain("-₹850");
+    expect(svg).toContain("+₹600");
   });
 
   it("escapes month labels", () => {

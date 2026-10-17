@@ -12,7 +12,7 @@
  */
 
 import { html, raw, formatCurrency } from "../../utils/html.js";
-import { balanceSentence } from "./insights.js";
+import { asOfPhrase, balanceSentence } from "./insights.js";
 import {
   balanceLineSvg,
   dailyBarsSvg,
@@ -214,6 +214,8 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: 12.5px; min-wi
 .ledger tr.struck td { text-decoration: line-through; color: ${C.muted}; }
 .ledger tr.struck td.status { text-decoration: none; }
 .ledger tr.struck td.gave, .ledger tr.struck td.received { color: ${C.muted}; }
+.ledger tr.struck td.balance { text-decoration: none; }
+.ledger-note { font-size: 12px; color: ${C.muted}; margin: 8px 0 0; }
 .ledger td.empty { text-align: center; color: ${C.muted}; padding: 22px 8px; }
 .badge {
   display: inline-block;
@@ -264,7 +266,7 @@ function heroSection(data: ChatReportData): string {
   <div class="wordmark">Finzz</div>
   <div class="hero-sentence ${sign}">${sentence}</div>
   <div class="hero-sub">${data.me.name} &amp; ${data.friend.name} · ${data.period.label}</div>
-  <div class="hero-asof">as of the end of ${data.period.label}</div>
+  <div class="hero-asof">${asOfPhrase(data)}</div>
 </header>`;
 }
 
@@ -396,7 +398,7 @@ function ledgerRow(r: ReportLedgerRow, friendName: string): string {
     <td class="num gave">${r.direction === "gave" ? amount : ""}</td>
     <td class="num received">${r.direction === "received" ? amount : ""}</td>
     <td class="status"><span class="badge ${r.status}">${STATUS_LABEL[r.status]}</span></td>
-    <td class="num">${signedCurrency(r.runningBalance)}</td>
+    <td class="num balance">${signedCurrency(r.runningBalance)}</td>
   </tr>`;
 }
 
@@ -423,6 +425,7 @@ function ledgerSection(data: ChatReportData): string {
       <tbody>${rows}</tbody>
     </table>
   </div>
+  <p class="ledger-note">Balance: + means ${data.friend.name} owes you, − means you owe ${data.friend.name}</p>
 </section>`;
 }
 

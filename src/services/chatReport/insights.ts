@@ -29,6 +29,23 @@ function shortDate(day: string): string {
   return `${d} ${MONTHS[m - 1] ?? ""}`.trim();
 }
 
+/**
+ * When a balance is "as of": "as of 17 Oct 2026" while the report month is the
+ * current one (or later) in the viewer's timezone, because the month isn't over
+ * and the balance can still change; "at the end of September 2026" once it is
+ * past. Compared in the viewer's timezone, never the server's.
+ */
+export function asOfPhrase(data: ChatReportData): string {
+  const endOf = `at the end of ${data.period.label}`;
+  const ms = Date.parse(data.generatedAtUtc);
+  if (Number.isNaN(ms)) return endOf;
+  const local = new Date(ms + (data.period.tzOffsetMinutes || 0) * 60_000);
+  const nowIndex = local.getUTCFullYear() * 12 + local.getUTCMonth();
+  const periodIndex = data.period.year * 12 + (data.period.month - 1);
+  if (periodIndex < nowIndex) return endOf;
+  return `as of ${local.getUTCDate()} ${MONTHS[local.getUTCMonth()]} ${local.getUTCFullYear()}`;
+}
+
 /** "Owes you" wording for a closing/any balance, in the report convention. */
 export function balanceSentence(balance: number, friendName: string): string {
   if (Math.abs(balance) < EPSILON) return `You and ${friendName} are all settled`;
@@ -46,7 +63,7 @@ export function buildInsights(data: ChatReportData): ReportInsight[] {
   // 1. balance
   out.push({
     kind: "balance",
-    text: `${balanceSentence(closing, friend)} at the end of ${data.period.label}`,
+    text: `${balanceSentence(closing, friend)} ${asOfPhrase(data)}`,
     tone: settled ? "neutral" : closing > 0 ? "positive" : "negative",
   });
 
@@ -144,24 +161,32 @@ export function buildInsights(data: ChatReportData): ReportInsight[] {
   }
 
   // 9. trend. month.net = received - gave, but the BALANCE (positive = friend
-  // owes the viewer) moves by gave - received = -net. So three negative nets
-  // in a row mean the balance rose each month (the friend owes the viewer more
-  // and more): "in your favour". Three positive nets mean it fell each month
-  // (the friend has been paying the viewer back): "in <friend>'s favour".
+  // owes the viewer) moves by gave - received = -net. Three months in a row of
+  // net < 0 mean the balance grew each month; three of net > 0 mean the friend
+  // has been paying the viewer back. Only calendar-consecutive months count and
+  // a zero month breaks the run.
   if (data.trend.length >= 3) {
-    const last3 = data.trend.slice(-3).map((m) => m.net);
-    if (last3.every((n) => n <= -EPSILON)) {
-      out.push({
-        kind: "trend",
-        text: "Balance has moved in your favour 3 months in a row",
-        tone: "positive",
-      });
-    } else if (last3.every((n) => n >= EPSILON)) {
-      out.push({
-        kind: "trend",
-        text: `Balance has moved in ${friend}'s favour 3 months in a row`,
-        tone: "negative",
-      });
+    const last3 = data.trend.slice(-3);
+    const consecutive = last3.every(
+      (m, i) =>
+        i === 0 ||
+        m.year * 12 + m.month === last3[i - 1].year * 12 + last3[i - 1].month + 1,
+    );
+    if (consecutive) {
+      const nets = last3.map((m) => m.net);
+      if (nets.every((v) => v <= -EPSILON)) {
+        out.push({
+          kind: "trend",
+          text: `${friend}'s balance owed to you has grown 3 months in a row`,
+          tone: "neutral",
+        });
+      } else if (nets.every((v) => v >= EPSILON)) {
+        out.push({
+          kind: "trend",
+          text: `${friend} has been paying you back — 3 months in a row`,
+          tone: "positive",
+        });
+      }
     }
   }
 

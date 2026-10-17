@@ -150,8 +150,28 @@ describe("renderChatReportHtml", () => {
     expect(out).toContain("You owe Summer");
     expect(out).toContain("Summer owes you"); // opening balance caption (+250)
     expect(out).toContain("Aryan &amp; Summer");
-    expect(out).toContain("as of the end of October 2026");
+    expect(out).toContain("as of 17 Oct 2026");
+    expect(out).not.toContain("end of October 2026");
     expect(out).toContain("₹250.00");
+  });
+
+  it("hero says 'at the end of September 2026' for a past month", () => {
+    const out = renderChatReportHtml(
+      makeData({
+        period: {
+          year: 2026,
+          month: 9,
+          label: "September 2026",
+          startUtc: "2026-08-31T18:30:00.000Z",
+          endUtc: "2026-09-30T18:30:00.000Z",
+          daysInMonth: 30,
+          tzOffsetMinutes: 330,
+        },
+      }),
+      insights,
+    );
+    expect(out).toContain("at the end of September 2026");
+    expect(out).not.toContain("as of 17 Oct 2026");
   });
 
   it("says Settled for a zero balance", () => {
@@ -192,6 +212,25 @@ describe("renderChatReportHtml", () => {
     expect(out).toMatch(/<tr class="[^"]*\bstruck\b[^"]*">/);
     expect(out.match(/class="[^"]*\bstruck\b/g)).toHaveLength(1);
     for (const s of ["Verified", "Pending", "Rejected"]) expect(out).toContain(s);
+  });
+
+  it("explains the sign of the Balance column with a caption", () => {
+    const out = renderChatReportHtml(makeData(), insights);
+    expect(out).toContain("Balance: + means Summer owes you, − means you owe Summer");
+    const hostile = renderChatReportHtml(makeData({ friend: { id: "u2", name: XSS_NAME } }), insights);
+    expect(hostile).not.toContain("<script");
+  });
+
+  it("does not strike through the Balance cell of a rejected row", () => {
+    const out = renderChatReportHtml(makeData(), insights);
+    const tr = /<tr class="[^"]*\bstruck\b[^"]*">([\s\S]*?)<\/tr>/.exec(out)![1];
+    const cells = tr.match(/<td[^>]*>[\s\S]*?<\/td>/g)!;
+    const balanceCell = cells[cells.length - 1];
+    expect(balanceCell).toMatch(/class="[^"]*\bbalance\b[^"]*"/);
+    // The stylesheet must switch the line-through off for that cell.
+    const rule = /\.ledger tr\.struck td\.balance\s*\{([^}]*)\}/.exec(out);
+    expect(rule).not.toBeNull();
+    expect(rule![1]).toMatch(/text-decoration:\s*none/);
   });
 
   it("formats ledger dates as '12 Oct' and uses a dash for empty remarks", () => {

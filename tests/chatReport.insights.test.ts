@@ -68,9 +68,10 @@ const kinds = (list: ReportInsight[]) => list.map((i) => i.kind);
 const find = (list: ReportInsight[], kind: ReportInsight["kind"]) =>
   list.find((i) => i.kind === kind);
 
+const MONTH_NUMBER: Record<string, number> = { Jun: 6, Jul: 7, Aug: 8, Sep: 9, Oct: 10, Nov: 11 };
 const month = (label: string, net: number): ReportMonthNet => ({
   year: 2026,
-  month: 1,
+  month: MONTH_NUMBER[label] ?? 1,
   label,
   gave: net < 0 ? -net : 0,
   received: net > 0 ? net : 0,
@@ -101,7 +102,7 @@ describe("buildInsights: empty month", () => {
   it("only the balance insight (settled) for a quiet, settled month", () => {
     const out = buildInsights(make());
     expect(kinds(out)).toEqual(["balance"]);
-    expect(out[0].text).toBe("You and Summer are all settled at the end of October 2026");
+    expect(out[0].text).toBe("You and Summer are all settled as of 17 Oct 2026");
     expect(out[0].tone).toBe("neutral");
   });
 });
@@ -109,13 +110,33 @@ describe("buildInsights: empty month", () => {
 describe("balance", () => {
   it("positive: tone positive, with the period label", () => {
     const i = find(buildInsights(make({ closingBalance: 4250 })), "balance")!;
-    expect(i.text).toBe("Summer owes you ₹4,250.00 at the end of October 2026");
+    expect(i.text).toBe("Summer owes you ₹4,250.00 as of 17 Oct 2026");
     expect(i.tone).toBe("positive");
   });
   it("negative: tone negative", () => {
     const i = find(buildInsights(make({ closingBalance: -4250 })), "balance")!;
-    expect(i.text).toBe("You owe Summer ₹4,250.00 at the end of October 2026");
+    expect(i.text).toBe("You owe Summer ₹4,250.00 as of 17 Oct 2026");
     expect(i.tone).toBe("negative");
+  });
+  it("current month reads 'as of 17 Oct 2026', never 'end of'", () => {
+    const text = find(buildInsights(make({ closingBalance: 5 })), "balance")!.text;
+    expect(text).toContain("as of 17 Oct 2026");
+    expect(text).not.toContain("end of");
+  });
+  it("past month reads 'at the end of September 2026'", () => {
+    const d = make({
+      closingBalance: 5,
+      period: { ...empty().period, month: 9, label: "September 2026", daysInMonth: 30 },
+    });
+    expect(find(buildInsights(d), "balance")!.text).toBe(
+      "Summer owes you ₹5.00 at the end of September 2026",
+    );
+  });
+  it("compares in the viewer's timezone: 31 Oct 20:00 UTC is already 1 Nov in IST", () => {
+    const d = make({ closingBalance: 5, generatedAtUtc: "2026-10-31T20:00:00.000Z" });
+    expect(find(buildInsights(d), "balance")!.text).toBe(
+      "Summer owes you ₹5.00 at the end of October 2026",
+    );
   });
   it("is always first", () => {
     const out = buildInsights(
@@ -366,17 +387,23 @@ describe("whoAdded", () => {
 
 describe("trend", () => {
   // net = received - gave. The balance (friend owes viewer) moves by gave - received = -net.
-  it("net negative 3 months in a row: balance rose, Summer owes you more -> your favour", () => {
+  it("balance change > 0 for 3 months in a row: neutral 'has grown' wording", () => {
     const d = make({ trend: [month("Aug", 50), month("Sep", -10), month("Oct", -20), month("Nov", -5)] });
     const i = find(buildInsights(d), "trend")!;
-    expect(i.text).toBe("Balance has moved in your favour 3 months in a row");
-    expect(i.tone).toBe("positive");
+    expect(i.text).toBe("Summer's balance owed to you has grown 3 months in a row");
+    expect(i.tone).toBe("neutral");
   });
-  it("net positive 3 months in a row: balance fell -> Summer's favour", () => {
+  it("balance change < 0 for 3 months in a row: Summer is paying you back (positive)", () => {
     const d = make({ trend: [month("Aug", 10), month("Sep", 20), month("Oct", 5)] });
     const i = find(buildInsights(d), "trend")!;
-    expect(i.text).toBe("Balance has moved in Summer's favour 3 months in a row");
-    expect(i.tone).toBe("negative");
+    expect(i.text).toBe("Summer has been paying you back — 3 months in a row");
+    expect(i.tone).toBe("positive");
+  });
+  it("never says 'favour'", () => {
+    for (const nets of [[-1, -1, -1], [1, 1, 1]]) {
+      const d = make({ trend: [month("Aug", nets[0]), month("Sep", nets[1]), month("Oct", nets[2])] });
+      expect(find(buildInsights(d), "trend")!.text).not.toMatch(/favour/i);
+    }
   });
   it("mixed signs: absent", () => {
     const d = make({ trend: [month("Aug", 10), month("Sep", -20), month("Oct", 5)] });
@@ -386,13 +413,27 @@ describe("trend", () => {
     const d = make({ trend: [month("Aug", 10), month("Sep", 0), month("Oct", 5)] });
     expect(find(buildInsights(d), "trend")).toBeUndefined();
   });
+  it("months that are not consecutive do not make a run", () => {
+    const d = make({ trend: [month("Jun", 10), month("Aug", 20), month("Oct", 5)] });
+    expect(find(buildInsights(d), "trend")).toBeUndefined();
+  });
+  it("a run across a year boundary counts", () => {
+    const d = make({
+      trend: [
+        { ...month("Nov", -1), year: 2025, month: 11 },
+        { ...month("Dec", -1), year: 2025, month: 12 },
+        { ...month("Jan", -1), year: 2026, month: 1 },
+      ],
+    });
+    expect(find(buildInsights(d), "trend")!.text).toContain("has grown 3 months in a row");
+  });
   it("fewer than 3 months: absent", () => {
     const d = make({ trend: [month("Sep", 10), month("Oct", 5)] });
     expect(find(buildInsights(d), "trend")).toBeUndefined();
   });
   it("only the last 3 months matter", () => {
     const d = make({ trend: [month("Jul", -9), month("Aug", 4), month("Sep", 3), month("Oct", 2)] });
-    expect(find(buildInsights(d), "trend")!.text).toContain("Summer's favour");
+    expect(find(buildInsights(d), "trend")!.text).toContain("paying you back");
   });
 });
 
