@@ -74,6 +74,31 @@ const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
 /**
+ * Ticket bookkeeping (saving ticket ids, pruning dead tokens) runs off the
+ * request path. In-flight work is tracked here so tests can wait for it.
+ */
+const pendingWork = new Set<Promise<void>>();
+
+const runInBackground = (label: string, work: () => Promise<void>): void => {
+  const task: Promise<void> = Promise.resolve()
+    .then(work)
+    .catch((error) => {
+      console.error(`[push] ${label} failed:`, errorMessage(error));
+    })
+    .finally(() => {
+      pendingWork.delete(task);
+    });
+  pendingWork.add(task);
+};
+
+/** Wait for all in-flight background bookkeeping. Intended for tests. */
+export async function flushPendingPushWork(): Promise<void> {
+  while (pendingWork.size > 0) {
+    await Promise.allSettled([...pendingWork]);
+  }
+}
+
+/**
  * Remember the ids of accepted tickets so their delivery receipts can be
  * fetched later (see pushReceipts.ts). Best effort: a database problem here
  * must never stop notifications from being sent.
@@ -139,8 +164,8 @@ const dispatch = async (
         if (ticket.status === "ok") accepted += 1;
         else rejected += 1;
       }
-      await persistTickets(slice, tickets);
-      await pruneDeadTokens(slice, tickets);
+      runInBackground("persist tickets", () => persistTickets(slice, tickets));
+      runInBackground("prune dead tokens", () => pruneDeadTokens(slice, tickets));
     } catch (error) {
       // A transport failure fails the whole chunk; count it honestly.
       rejected += chunk.length;
@@ -162,14 +187,19 @@ export async function sendPushNotification(
   data?: Record<string, unknown>,
 ): Promise<DeliveryReport> {
   try {
-    await Notification.create({
-      recipient: userId,
-      sender: data?.senderId,
-      type: data?.type,
-      title,
-      body,
-      data,
-    });
+    // The in-app feed row must never stop the push itself.
+    try {
+      await Notification.create({
+        recipient: userId,
+        sender: data?.senderId,
+        type: data?.type,
+        title,
+        body,
+        data,
+      });
+    } catch (error) {
+      console.error("[push] could not save feed notification:", errorMessage(error));
+    }
 
     const user = await User.findById(userId)
       .select("pushTokens pushToken")
@@ -223,16 +253,21 @@ export async function sendBulkPushNotifications(
       users.map((u: any) => [String(u._id), collectTokens(u)]),
     );
 
-    await Notification.insertMany(
-      notifications.map((n) => ({
-        recipient: n.userId,
-        sender: n.data?.senderId,
-        type: n.data?.type,
-        title: n.title,
-        body: n.body,
-        data: n.data,
-      })),
-    );
+    // The in-app feed rows must never stop the push itself.
+    try {
+      await Notification.insertMany(
+        notifications.map((n) => ({
+          recipient: n.userId,
+          sender: n.data?.senderId,
+          type: n.data?.type,
+          title: n.title,
+          body: n.body,
+          data: n.data,
+        })),
+      );
+    } catch (error) {
+      console.error("[push] could not save feed notifications:", errorMessage(error));
+    }
 
     const messages: ExpoPushMessage[] = [];
     let skipped = 0;

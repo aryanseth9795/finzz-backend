@@ -9,7 +9,7 @@ export interface IPushTicket extends Document {
   createdAt: Date;
   /** Set once the receipt has been fetched. */
   checkedAt?: Date;
-  status?: "ok" | "error";
+  status?: "ok" | "error" | "expired";
   /** `details.error` from the receipt, e.g. `InvalidCredentials`. */
   error?: string;
   message?: string;
@@ -28,7 +28,7 @@ const pushTicketSchema = new Schema<IPushTicket>(
     userId: { type: Schema.Types.ObjectId, ref: "User" },
     createdAt: { type: Date, default: Date.now },
     checkedAt: { type: Date },
-    status: { type: String, enum: ["ok", "error"] },
+    status: { type: String, enum: ["ok", "error", "expired"] },
     error: { type: String },
     message: { type: String },
   },

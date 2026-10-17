@@ -6,6 +6,7 @@ import {
   updateProfile,
   refreshToken,
   updatePushToken,
+  updatePushStatus,
   removePushToken,
   uploadAvatar,
 } from "../controllers/usercontroller.js";
@@ -32,6 +33,7 @@ import {
   registerSchema,
   updateProfileSchema,
   updatePushTokenSchema,
+  updatePushStatusSchema,
   sendOtpSchema,
   verifyOtpSchema,
   resetPasswordSchema,
@@ -100,6 +102,12 @@ router.post(
   isAuthenticated,
   validate(updatePushTokenSchema),
   updatePushToken,
+);
+router.post(
+  "/push-status",
+  isAuthenticated,
+  validate(updatePushStatusSchema),
+  updatePushStatus,
 );
 router.post(
   "/remove-push-token",

@@ -49,7 +49,7 @@ describe("POST /admin/notifications/targeted", () => {
     expect(res.body.accepted).toBe(1);
     expect(res.body.rejected).toBe(0);
     expect(res.body.skipped).toBe(0);
-    expect(res.body.message).toContain("Sent to 1 device(s)");
+    expect(res.body.message).toContain("Queued 1 notification(s) at Expo");
     expect(send).toHaveBeenCalledTimes(1);
 
     const stored = await Notification.findOne({ recipient: user.id }).lean();

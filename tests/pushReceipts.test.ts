@@ -16,7 +16,12 @@ import {
   processPushReceipts,
   recentDeliveryStats,
 } from "../src/services/pushReceipts.js";
-import { sendPushNotification } from "../src/services/notificationService.js";
+import { Notification } from "../src/models/notificationModel.js";
+import {
+  sendPushNotification,
+  sendBulkPushNotifications,
+  flushPendingPushWork,
+} from "../src/services/notificationService.js";
 
 const TOKEN_A = "ExponentPushToken[aaaaaaaaaaaaaaaaaaaaaa]";
 const TOKEN_B = "ExponentPushToken[bbbbbbbbbbbbbbbbbbbbbb]";
@@ -193,6 +198,7 @@ describe("push receipts", () => {
       senderId: String(user._id),
     });
     expect(report.accepted).toBe(1);
+    await flushPendingPushWork();
 
     const row = await PushTicket.findOne({ ticketId: "tk1" }).lean();
     expect(row).toBeTruthy();
@@ -259,5 +265,186 @@ describe("push receipts", () => {
     const stats = await recentDeliveryStats();
     expect(stats).toMatchObject({ total: 0, checked: 0, ok: 0, errors: {} });
     expect(stats.lastError).toBeUndefined();
+  });
+});
+
+describe("receipt window", () => {
+  const HOUR = 60 * MIN;
+
+  it("only fetches unchecked tickets from the last 24 hours", async () => {
+    await PushTicket.create([
+      { ticketId: "recent", token: TOKEN_A, createdAt: new Date(Date.now() - 23 * HOUR) },
+      { ticketId: "stale", token: TOKEN_B, createdAt: new Date(Date.now() - 25 * HOUR) },
+    ]);
+    const spy = mockReceipts({ recent: { status: "ok" }, stale: { status: "ok" } });
+
+    const result = await processPushReceipts();
+
+    expect(result.checked).toBe(1);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][0]).toEqual(["recent"]);
+  });
+
+  it("marks unchecked tickets older than 24 hours as expired", async () => {
+    await PushTicket.create([
+      { ticketId: "stale", token: TOKEN_B, createdAt: new Date(Date.now() - 25 * HOUR) },
+      { ticketId: "fresh", token: TOKEN_A, createdAt: minutesAgo(20) },
+      {
+        ticketId: "done",
+        token: TOKEN_A,
+        createdAt: new Date(Date.now() - 26 * HOUR),
+        checkedAt: new Date(),
+        status: "ok",
+      },
+    ]);
+    mockReceipts({});
+
+    await processPushReceipts();
+
+    const byId = Object.fromEntries(
+      (await PushTicket.find().lean()).map((r) => [r.ticketId, r]),
+    );
+    expect(byId.stale.status).toBe("expired");
+    expect(byId.fresh.status).toBeUndefined();
+    expect(byId.done.status).toBe("ok");
+  });
+
+  it("expired tickets are never queried again", async () => {
+    await PushTicket.create({
+      ticketId: "stale",
+      token: TOKEN_B,
+      createdAt: new Date(Date.now() - 25 * HOUR),
+    });
+    const spy = mockReceipts({ stale: { status: "ok" } });
+
+    await processPushReceipts();
+    await processPushReceipts();
+
+    expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe("fetch failures", () => {
+  it("reports how many receipt chunks failed", async () => {
+    await PushTicket.create({
+      ticketId: "t1",
+      token: TOKEN_A,
+      createdAt: minutesAgo(20),
+    });
+    vi.spyOn(Expo.prototype, "getPushNotificationReceiptsAsync").mockRejectedValue(
+      new Error("expo down"),
+    );
+
+    const result = await processPushReceipts();
+
+    expect(result.fetchFailed).toBe(1);
+    expect(result.checked).toBe(0);
+    const row = await PushTicket.findOne({ ticketId: "t1" }).lean();
+    expect(row?.checkedAt).toBeUndefined();
+  });
+
+  it("fetchFailed is 0 on success and when there is nothing to check", async () => {
+    expect((await processPushReceipts()).fetchFailed).toBe(0);
+    await PushTicket.create({ ticketId: "t1", token: TOKEN_A, createdAt: minutesAgo(20) });
+    mockReceipts({ t1: { status: "ok" } });
+    expect((await processPushReceipts()).fetchFailed).toBe(0);
+  });
+});
+
+describe("sending is not blocked by bookkeeping", () => {
+  it("still pushes when the feed insert fails (single)", async () => {
+    const user = await makeUser({ pushTokens: [TOKEN_A] });
+    const send = vi
+      .spyOn(Expo.prototype, "sendPushNotificationsAsync")
+      .mockResolvedValue([{ status: "ok", id: "f1" }]);
+    vi.spyOn(Notification, "create").mockRejectedValue(new Error("db down"));
+
+    const report = await sendPushNotification(String(user._id), "Hi", "Body");
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(report.accepted).toBe(1);
+    expect(report.error).toBeUndefined();
+    expect(console.error).toHaveBeenCalled();
+  });
+
+  it("still pushes when the feed insert fails (bulk)", async () => {
+    const user = await makeUser({ pushTokens: [TOKEN_A] });
+    const send = vi
+      .spyOn(Expo.prototype, "sendPushNotificationsAsync")
+      .mockResolvedValue([{ status: "ok", id: "f2" }]);
+    vi.spyOn(Notification, "insertMany").mockRejectedValue(new Error("db down"));
+
+    const report = await sendBulkPushNotifications([
+      { userId: String(user._id), title: "Hi", body: "Body" },
+    ]);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(report.accepted).toBe(1);
+    expect(report.error).toBeUndefined();
+  });
+
+  it("reports error only for a real send-path failure", async () => {
+    vi.spyOn(User, "find").mockImplementation((() => {
+      throw new Error("db down");
+    }) as any);
+
+    const report = await sendBulkPushNotifications([
+      { userId: "64b000000000000000000000", title: "Hi", body: "Body" },
+    ]);
+
+    expect(report.error).toBe("db down");
+  });
+
+  it("does not await ticket bookkeeping", async () => {
+    const user = await makeUser({ pushTokens: [TOKEN_A] });
+    vi.spyOn(Expo.prototype, "sendPushNotificationsAsync").mockResolvedValue([
+      { status: "ok", id: "slow1" },
+    ]);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const realInsert = PushTicket.insertMany.bind(PushTicket);
+    vi.spyOn(PushTicket, "insertMany").mockImplementation((async (...args: any[]) => {
+      await gate;
+      return (realInsert as any)(...args);
+    }) as any);
+
+    const report = await sendPushNotification(String(user._id), "Hi", "Body");
+    expect(report.accepted).toBe(1);
+    expect(await PushTicket.countDocuments()).toBe(0);
+
+    release();
+    await flushPendingPushWork();
+    expect(await PushTicket.countDocuments()).toBe(1);
+  });
+
+  it("logs, and does not throw, when bookkeeping fails", async () => {
+    const user = await makeUser({ pushTokens: [TOKEN_A] });
+    vi.spyOn(Expo.prototype, "sendPushNotificationsAsync").mockResolvedValue([
+      { status: "ok", id: "bk1" },
+    ]);
+    vi.spyOn(PushTicket, "insertMany").mockRejectedValue(new Error("db down"));
+
+    const report = await sendPushNotification(String(user._id), "Hi", "Body");
+    await expect(flushPendingPushWork()).resolves.toBeUndefined();
+
+    expect(report.accepted).toBe(1);
+    expect(console.error).toHaveBeenCalledWith(
+      "[push] could not persist tickets:",
+      "db down",
+    );
+  });
+
+  it("prunes dead tokens in the background", async () => {
+    const user = await makeUser({ pushTokens: [TOKEN_A, TOKEN_B] });
+    vi.spyOn(Expo.prototype, "sendPushNotificationsAsync").mockResolvedValue([
+      { status: "error", message: "gone", details: { error: "DeviceNotRegistered" } },
+      { status: "ok", id: "pr1" },
+    ]);
+
+    await sendPushNotification(String(user._id), "Hi", "Body");
+    await flushPendingPushWork();
+
+    const after = await User.findById(user._id).lean();
+    expect(after?.pushTokens).toEqual([TOKEN_B]);
   });
 });

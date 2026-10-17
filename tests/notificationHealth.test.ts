@@ -117,6 +117,37 @@ describe("GET /admin/notifications/health", () => {
     expect(row!.checkedAt).toBeTruthy();
   });
 
+  it("check=1 reports checkFailed when Expo could not be reached", async () => {
+    await PushTicket.create({ ticketId: "t-new-3", token: TOKEN });
+    vi.spyOn(Expo.prototype, "getPushNotificationReceiptsAsync").mockRejectedValue(
+      new Error("expo down"),
+    );
+    const cookie = await adminCookie(app);
+
+    const res = await request(app).get(`${HEALTH}?check=1`).set("Cookie", cookie);
+
+    expect(res.status).toBe(200);
+    expect(res.body.checkFailed).toBe(true);
+  });
+
+  it("check=1 reports checkFailed=false when every chunk succeeded", async () => {
+    await PushTicket.create({ ticketId: "t-new-4", token: TOKEN });
+    vi.spyOn(Expo.prototype, "getPushNotificationReceiptsAsync").mockResolvedValue({
+      "t-new-4": { status: "ok" },
+    } as any);
+    const cookie = await adminCookie(app);
+
+    const res = await request(app).get(`${HEALTH}?check=1`).set("Cookie", cookie);
+
+    expect(res.body.checkFailed).toBe(false);
+  });
+
+  it("omits checkFailed without check=1", async () => {
+    const cookie = await adminCookie(app);
+    const res = await request(app).get(HEALTH).set("Cookie", cookie);
+    expect(res.body.checkFailed).toBeUndefined();
+  });
+
   it("does not call Expo without check=1", async () => {
     await PushTicket.create({ ticketId: "t-new-2", token: TOKEN });
     const receipts = vi.spyOn(Expo.prototype, "getPushNotificationReceiptsAsync");
@@ -142,7 +173,7 @@ describe("notification send responses", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.message).toBe(
-      "Queued 1 notification(s) at Expo. Delivery is confirmed by receipts about 15 minutes later — see Delivery health.",
+      "Queued 1 notification(s) at Expo. Delivery is confirmed within ~25 minutes, or press Check now.",
     );
     expect(res.body.message).not.toContain("Delivered");
     expect(res.body.accepted).toBe(1);
@@ -150,14 +181,58 @@ describe("notification send responses", () => {
     expect(res.body.sentCount).toBe(1);
   });
 
-  it("targeted returns 500 when the send path fails", async () => {
+  it("targeted says Queued, never Sent", async () => {
     vi.spyOn(Expo.prototype, "sendPushNotificationsAsync").mockResolvedValue([
-      { status: "ok", id: "x1" },
+      { status: "ok", id: "q1" },
     ]);
+    const user = await registerUser(app);
+    await User.updateOne({ _id: user.id }, { $set: { pushTokens: [TOKEN] } });
+    const cookie = await adminCookie(app);
+
+    const res = await request(app)
+      .post("/api/v1/admin/notifications/targeted")
+      .set("Cookie", cookie)
+      .send({ userIds: [user.id], title: "Hello", body: "World" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe("Queued 1 notification(s) at Expo");
+  });
+
+  it("targeted still pushes and returns 200 when the feed insert fails", async () => {
+    const send = vi
+      .spyOn(Expo.prototype, "sendPushNotificationsAsync")
+      .mockResolvedValue([{ status: "ok", id: "x1" }]);
     vi.spyOn(Notification, "insertMany").mockRejectedValue(new Error("db down"));
     const user = await registerUser(app);
     await User.updateOne({ _id: user.id }, { $set: { pushTokens: [TOKEN] } });
     const cookie = await adminCookie(app);
+
+    const res = await request(app)
+      .post("/api/v1/admin/notifications/targeted")
+      .set("Cookie", cookie)
+      .send({ userIds: [user.id], title: "Hello", body: "World" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.accepted).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("targeted returns 500 when the send path fails", async () => {
+    vi.spyOn(Expo.prototype, "sendPushNotificationsAsync").mockResolvedValue([
+      { status: "ok", id: "x2" },
+    ]);
+    const user = await registerUser(app);
+    await User.updateOne({ _id: user.id }, { $set: { pushTokens: [TOKEN] } });
+    const cookie = await adminCookie(app);
+
+    // The controller looks recipients up first; fail the service's own lookup.
+    const realFind = User.find.bind(User);
+    let calls = 0;
+    vi.spyOn(User, "find").mockImplementation(((...args: any[]) => {
+      calls += 1;
+      if (calls === 2) throw new Error("db down");
+      return (realFind as any)(...args);
+    }) as any);
 
     const res = await request(app)
       .post("/api/v1/admin/notifications/targeted")

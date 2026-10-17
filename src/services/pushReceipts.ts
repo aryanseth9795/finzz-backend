@@ -7,6 +7,8 @@ const expo = new Expo();
 /** Expo makes receipts available roughly 15 minutes after sending. */
 const DEFAULT_OLDER_THAN_MS = 15 * 60 * 1000;
 const DEFAULT_LIMIT = 1000;
+/** Expo only keeps receipts for about a day; older tickets can never resolve. */
+const RECEIPT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
@@ -16,6 +18,8 @@ export interface ReceiptRunResult {
   ok: number;
   errors: Record<string, number>;
   pruned: number;
+  /** Receipt chunks whose request to Expo failed (their tickets stay unchecked). */
+  fetchFailed: number;
 }
 
 /**
@@ -32,11 +36,35 @@ export async function processPushReceipts(
   const olderThanMs = opts.olderThanMs ?? DEFAULT_OLDER_THAN_MS;
   const limit = opts.limit ?? DEFAULT_LIMIT;
 
-  const result: ReceiptRunResult = { checked: 0, ok: 0, errors: {}, pruned: 0 };
+  const result: ReceiptRunResult = {
+    checked: 0,
+    ok: 0,
+    errors: {},
+    pruned: 0,
+    fetchFailed: 0,
+  };
+
+  const startedAt = Date.now();
+  const windowStart = new Date(startedAt - RECEIPT_WINDOW_MS);
+
+  // Expo drops receipts after about a day. Retire older unchecked tickets so
+  // they stop being re-queried on every run.
+  try {
+    await PushTicket.updateMany(
+      {
+        checkedAt: { $exists: false },
+        status: { $exists: false },
+        createdAt: { $lt: windowStart },
+      },
+      { $set: { status: "expired" } },
+    );
+  } catch (error) {
+    console.error("[push-receipts] expiry failed:", errorMessage(error));
+  }
 
   const tickets = await PushTicket.find({
     checkedAt: { $exists: false },
-    createdAt: { $lte: new Date(Date.now() - olderThanMs) },
+    createdAt: { $gte: windowStart, $lte: new Date(startedAt - olderThanMs) },
   })
     .sort({ createdAt: 1 })
     .limit(limit)
@@ -60,6 +88,7 @@ export async function processPushReceipts(
     } catch (error) {
       // Leave these tickets unchecked; the next run retries them.
       console.error("[push-receipts] fetch failed:", errorMessage(error));
+      result.fetchFailed += 1;
       continue;
     }
 

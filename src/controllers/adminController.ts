@@ -704,7 +704,7 @@ export const sendBulkNotification = TryCatch(
       success: true,
       message:
         `Queued ${report.accepted} notification(s) at Expo. ` +
-        `Delivery is confirmed by receipts about 15 minutes later — see Delivery health.`,
+        `Delivery is confirmed within ~25 minutes, or press Check now.`,
       // Three distinct numbers, because they mean three different things.
       // `sentCount` previously counted messages *submitted* to Expo and was
       // reported to the operator as a delivery count.
@@ -776,7 +776,7 @@ export const sendTargetedNotification = TryCatch(
         return next(new ErrorHandler("Failed to send the notification", 500));
       }
 
-      let message = `Sent to ${report.accepted} device(s)`;
+      let message = `Queued ${report.accepted} notification(s) at Expo`;
       if (report.rejected > 0) message += `; ${report.rejected} rejected`;
       if (report.skipped > 0) {
         message += `; ${report.skipped} user(s) skipped (no device or send failed)`;
@@ -804,8 +804,10 @@ export const sendTargetedNotification = TryCatch(
 // ==========================================
 export const getNotificationHealth = TryCatch(
   async (req: Request, res: Response) => {
+    let checkFailed: boolean | undefined;
     if (req.query.check === "1") {
-      await processPushReceipts({ olderThanMs: 0 });
+      const run = await processPushReceipts({ olderThanMs: 0 });
+      checkFailed = run.fetchFailed > 0;
     }
 
     const last24h = await recentDeliveryStats();
@@ -825,6 +827,11 @@ export const getNotificationHealth = TryCatch(
       hint = "No pushes were sent in the last 24 hours.";
     }
 
-    res.status(200).json({ success: true, last24h, hint });
+    res.status(200).json({
+      success: true,
+      last24h,
+      hint,
+      ...(checkFailed === undefined ? {} : { checkFailed }),
+    });
   },
 );

@@ -151,6 +151,21 @@ export const updatePushTokenSchema = z.object({
   }),
 });
 
+export const updatePushStatusSchema = z.object({
+  body: z.object({
+    outcome: z.enum([
+      "registered",
+      "unchanged",
+      "permission-denied",
+      "not-a-device",
+      "no-project-id",
+      "token-error",
+      "upload-error",
+    ]),
+    detail: z.string().max(200, "Detail too long").optional(),
+  }),
+});
+
 export const sendOtpSchema = z.object({
   body: z.object({
     email: z.string().email("Invalid email address"),

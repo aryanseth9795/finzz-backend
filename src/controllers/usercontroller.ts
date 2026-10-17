@@ -265,6 +265,29 @@ export const updatePushToken = TryCatch(
   },
 );
 
+// Record how this device's push registration went, so the admin can see why a
+// user is not receiving notifications.
+export const updatePushStatus = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const { outcome, detail } = req.body;
+
+    await User.updateOne(
+      { _id: req.user.id },
+      {
+        $set: {
+          pushStatus: {
+            outcome,
+            ...(typeof detail === "string" && detail ? { detail } : {}),
+            at: new Date(),
+          },
+        },
+      },
+    );
+
+    res.status(200).json({ success: true, message: "Push status recorded" });
+  },
+);
+
 // Remove this device's push token (called on logout)
 export const removePushToken = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
