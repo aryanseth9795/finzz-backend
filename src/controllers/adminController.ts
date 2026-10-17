@@ -1,5 +1,6 @@
 import { NextFunction, Request, Response } from "express";
 import mongoose from "mongoose";
+import { Expo } from "expo-server-sdk";
 import crypto from "crypto";
 import TryCatch from "../utils/TryCatch.js";
 import { User } from "../models/userModel.js";
@@ -736,35 +737,55 @@ export const sendTargetedNotification = TryCatch(
       return next(new ErrorHandler("One or more user ids are invalid", 400));
     }
 
-    const report = await sendBulkPushNotifications(
-      userIds.map((userId: string) => ({
-        userId,
-        title,
-        body,
-        data: { type: "admin_targeted" },
-      })),
-    );
-
-    if (report.accepted === 0 && report.rejected === 0) {
-      return next(
-        new ErrorHandler(
-          "None of the selected users have valid push tokens",
-          404,
+    try {
+      // Distinguish "nobody has a device" from "the send ran" so the admin sees
+      // an accurate reason instead of a generic failure.
+      const recipients = await User.find({ _id: { $in: userIds } })
+        .select("pushTokens pushToken")
+        .lean();
+      const withDevice = recipients.filter((u: any) =>
+        [...(u.pushTokens ?? []), u.pushToken].some(
+          (t) => typeof t === "string" && Expo.isExpoPushToken(t),
         ),
-      );
-    }
+      ).length;
 
-    res.status(200).json({
-      success: true,
-      message:
-        `Delivered to ${report.accepted} device(s); ${report.rejected} rejected, ` +
-        `${report.skipped} of ${userIds.length} selected user(s) had no push token.`,
-      totalSelectedUsers: userIds.length,
-      accepted: report.accepted,
-      rejected: report.rejected,
-      skipped: report.skipped,
-      /** @deprecated use `accepted`. */
-      sentCount: report.accepted,
-    });
+      if (withDevice === 0) {
+        return next(
+          new ErrorHandler(
+            "None of the selected users has a device registered for notifications",
+            404,
+          ),
+        );
+      }
+
+      const report = await sendBulkPushNotifications(
+        userIds.map((userId: string) => ({
+          userId,
+          title,
+          body,
+          data: { type: "admin_targeted" },
+        })),
+      );
+
+      let message = `Sent to ${report.accepted} device(s)`;
+      if (report.rejected > 0) message += `; ${report.rejected} rejected`;
+      if (report.skipped > 0) {
+        message += `; ${report.skipped} user(s) skipped (no device or send failed)`;
+      }
+
+      res.status(200).json({
+        success: true,
+        message,
+        totalSelectedUsers: userIds.length,
+        accepted: report.accepted,
+        rejected: report.rejected,
+        skipped: report.skipped,
+        /** @deprecated use `accepted`. */
+        sentCount: report.accepted,
+      });
+    } catch (error) {
+      console.error("[admin] sendTargetedNotification failed:", error);
+      return next(new ErrorHandler("Failed to send the notification", 500));
+    }
   },
 );

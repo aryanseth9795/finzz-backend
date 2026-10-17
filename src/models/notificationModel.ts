@@ -2,7 +2,8 @@ import mongoose, { Document, Schema } from "mongoose";
 
 export interface INotification extends Document {
   recipient: mongoose.Types.ObjectId;
-  sender: mongoose.Types.ObjectId;
+  /** Absent for admin-originated (system) notifications. */
+  sender?: mongoose.Types.ObjectId;
   type:
     | "friend_request"
     | "friend_accepted"
@@ -15,7 +16,9 @@ export interface INotification extends Document {
     | "pool_tx_verified"
     | "pool_member_added"
     | "pool_member_removed"
-    | "note_shared";
+    | "note_shared"
+    | "admin_broadcast"
+    | "admin_targeted";
   title?: string;
   body?: string;
   data?: Record<string, any>;
@@ -35,7 +38,7 @@ const notificationSchema = new Schema<INotification>(
     sender: {
       type: Schema.Types.ObjectId,
       ref: "User",
-      required: true,
+      required: false,
     },
     type: {
       type: String,
@@ -52,6 +55,8 @@ const notificationSchema = new Schema<INotification>(
         "pool_member_added",
         "pool_member_removed",
         "note_shared",
+        "admin_broadcast",
+        "admin_targeted",
       ],
       required: true,
     },
