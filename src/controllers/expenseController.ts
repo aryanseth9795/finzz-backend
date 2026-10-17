@@ -12,7 +12,7 @@ import {
   monthRangeUtc,
   daysInMonth,
 } from "../utils/dates.js";
-import { expenseCategoryOf as reportCategoryOf } from "../services/expenseReport/category.js";
+import { expenseCategoryOf } from "../services/expenseReport/category.js";
 import { renderExpenseReportHtml } from "../services/expenseReport/template.js";
 import { decodeCursor, cursorFilter, paginate } from "../utils/cursor.js";
 
@@ -526,29 +526,6 @@ export const getStats = TryCatch(
 // ==========================================
 // Get Advanced Stats (Charts & Analytics)
 // ==========================================
-/**
- * The category label an expense is reported under: a leading `#tag` in the
- * remarks overrides the category field (the whole text after `#`); no category
- * (or "-") becomes "Other". Used by categoryBreakdown and categoryTrend.
- */
-export const expenseCategoryOf = (exp: {
-  category?: string | null;
-  remarks?: string | null;
-  [key: string]: unknown;
-}): string => {
-  let label = "Other";
-  if (exp.category && exp.category !== "-") {
-    label = exp.category;
-  }
-  if (exp.remarks) {
-    const match = exp.remarks.match(/^#\s*(.+)/);
-    if (match) {
-      label = match[1].trim();
-    }
-  }
-  return label;
-};
-
 /** "+05:30" / "-03:30" — the form Mongo's $dateToString `timezone` accepts. */
 const tzString = (tzOffsetMinutes: number): string => {
   const sign = tzOffsetMinutes < 0 ? "-" : "+";
@@ -964,7 +941,7 @@ function buildExpenseExportHtml({
     day: localDay(new Date(e.date)),
     inMonth: new Date(e.date) >= start && new Date(e.date) < end,
     remarks: (e.remarks as string) || "",
-    category: reportCategoryOf(e),
+    category: expenseCategoryOf(e),
     amount: Number(e.amount) || 0,
     type: (e.type === "credit" ? "credit" : "debit") as "debit" | "credit",
   }));

@@ -14,7 +14,7 @@ import {
   type TestUser,
 } from "./helpers.js";
 import { Expense } from "../src/models/expenseModel.js";
-import { expenseCategoryOf } from "../src/controllers/expenseController.js";
+import { expenseCategoryOf } from "../src/services/expenseReport/category.js";
 
 beforeAll(async () => {
   await connect();
@@ -135,6 +135,22 @@ describe("getAdvancedStats: categoryTrend", () => {
     const d = await stats({ year: 2026, month: 10 });
     expect(d.categoryTrend[0].name).toBe("travel");
     expect(d.categoryBreakdown[0].name).toBe("travel");
+  });
+
+  it("falls back to the category when the #tag is empty", async () => {
+    // Bypass the schema's trim so the stored remark really is "#   " (legacy rows).
+    await Expense.collection.insertOne({
+      userId: new mongoose.Types.ObjectId(alice.id),
+      ledgerId: new mongoose.Types.ObjectId(),
+      amount: 60,
+      type: "debit",
+      category: "food",
+      remarks: "#   ",
+      date: new Date("2026-10-05T06:00:00Z"),
+    });
+    const d = await stats({ year: 2026, month: 10 });
+    expect(d.categoryBreakdown.map((c: { name: string }) => c.name)).toEqual(["food"]);
+    expect(d.categoryTrend[0].name).toBe("food");
   });
 
   it("uses local-month bucketing for the trend points", async () => {
