@@ -14,7 +14,8 @@ export interface INotification extends Document {
     | "pool_tx_added"
     | "pool_tx_verified"
     | "pool_member_added"
-    | "pool_member_removed";
+    | "pool_member_removed"
+    | "note_shared";
   title?: string;
   body?: string;
   data?: Record<string, any>;
@@ -50,6 +51,7 @@ const notificationSchema = new Schema<INotification>(
         "pool_tx_verified",
         "pool_member_added",
         "pool_member_removed",
+        "note_shared",
       ],
       required: true,
     },

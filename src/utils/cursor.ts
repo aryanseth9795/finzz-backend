@@ -65,19 +65,24 @@ export const decodeCursor = (raw: unknown): Cursor | null => {
 
 /**
  * The MongoDB filter selecting everything strictly *after* the cursor under a
- * `{ date: -1, _id: -1 }` sort. Returns `{}` when there is no cursor.
+ * `{ [field]: -1, _id: -1 }` sort. Returns `{}` when there is no cursor.
+ *
+ * `field` defaults to `date` (the ledgers); notes page on `editedAt`.
  */
-export const cursorFilter = (cursor: Cursor | null): Record<string, unknown> => {
+export const cursorFilter = (
+  cursor: Cursor | null,
+  field = "date",
+): Record<string, unknown> => {
   if (!cursor) return {};
 
   // Legacy date-only cursor: the old, tie-dropping behaviour. Kept only so
   // existing clients keep working.
-  if (!cursor.id) return { date: { $lt: cursor.date } };
+  if (!cursor.id) return { [field]: { $lt: cursor.date } };
 
   return {
     $or: [
-      { date: { $lt: cursor.date } },
-      { date: cursor.date, _id: { $lt: cursor.id } },
+      { [field]: { $lt: cursor.date } },
+      { [field]: cursor.date, _id: { $lt: cursor.id } },
     ],
   };
 };
@@ -86,10 +91,13 @@ export const cursorFilter = (cursor: Cursor | null): Record<string, unknown> => 
  * Given one extra row fetched beyond the page size, split it into the page and
  * the pagination metadata. Fetching `limit + 1` is how `hasMore` is determined
  * without a second `countDocuments` query.
+ *
+ * `dateOf` picks the sort field the cursor is built from.
  */
-export const paginate = <T extends { _id: unknown; date: Date }>(
+export const paginateBy = <T extends { _id: unknown }>(
   rows: T[],
   limit: number,
+  dateOf: (row: T) => Date,
 ): { items: T[]; nextCursor: string | null; hasMore: boolean } => {
   const hasMore = rows.length > limit;
   const items = hasMore ? rows.slice(0, limit) : rows;
@@ -98,6 +106,13 @@ export const paginate = <T extends { _id: unknown; date: Date }>(
   return {
     items,
     hasMore,
-    nextCursor: hasMore && last ? encodeCursor(last.date, last._id) : null,
+    nextCursor: hasMore && last ? encodeCursor(dateOf(last), last._id) : null,
   };
 };
+
+/** `paginateBy` on the ledgers' `date` field. */
+export const paginate = <T extends { _id: unknown; date: Date }>(
+  rows: T[],
+  limit: number,
+): { items: T[]; nextCursor: string | null; hasMore: boolean } =>
+  paginateBy(rows, limit, (row) => row.date);
