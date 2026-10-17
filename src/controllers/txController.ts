@@ -311,37 +311,103 @@ export const reviewTxn = TryCatch(
       );
     }
 
-    if (action === "verify") {
-      txn.status = "verified";
-      txn.verifiedBy = new mongoose.Types.ObjectId(userId);
-      txn.verifiedAt = new Date();
-    } else {
-      txn.status = "rejected";
-      txn.rejectedBy = new mongoose.Types.ObjectId(userId);
-      txn.rejectedAt = new Date();
-      (txn as any).rejectionRemark = rejectionRemark;
-
-      await updateSummaryOnDelete(
-        txn.chatId,
-        txn.date,
-        txn.from.toString(),
-        txn.to.toString(),
-        txn.amount,
-      );
+    /**
+     * One conditional `findOneAndUpdate`, filtered on "still pending, not mine"
+     * and, when the client sent it, the `updatedAt` the reviewer saw. A reject's
+     * summary decrement runs in the same MongoDB transaction and only if the
+     * update matched, so two racing reviews can never both decrement, and a
+     * creator edit that lands first makes the review match nothing instead of
+     * approving a version the reviewer never saw.
+     */
+    const { expectedUpdatedAt } = req.body;
+    const filter: Record<string, unknown> = {
+      _id: txn._id,
+      status: { $in: ["pending", null] },
+      addedBy: { $ne: userId },
+    };
+    if (expectedUpdatedAt !== undefined) {
+      filter.updatedAt = new Date(expectedUpdatedAt);
     }
 
-    await txn.save();
+    const now = new Date();
+    const update =
+      action === "verify"
+        ? {
+            $set: {
+              status: "verified",
+              verified: true,
+              verifiedBy: userId,
+              verifiedAt: now,
+            },
+          }
+        : {
+            $set: {
+              status: "rejected",
+              verified: false,
+              rejectedBy: userId,
+              rejectedAt: now,
+              rejectionRemark,
+            },
+            $unset: { verifiedBy: "", verifiedAt: "" },
+          };
+
+    let updated: TxLike | null = null;
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        // The callback can be retried on a transient error.
+        updated = null;
+
+        updated = await Tx.findOneAndUpdate(filter, update, {
+          new: true,
+          session,
+        }).lean<TxLike | null>();
+
+        if (!updated || action !== "reject") return;
+
+        // Use the matched document's values: they are what the summary holds.
+        await updateSummaryOnDelete(
+          txn.chatId,
+          updated.date as Date,
+          String(updated.from),
+          String(updated.to),
+          updated.amount as number,
+          session,
+        );
+      });
+    } finally {
+      await session.endSession();
+    }
+
+    if (!updated) {
+      const latest = await Tx.findById(txnId).lean<TxLike | null>();
+      if (!latest) {
+        return next(new ErrorHandler("Transaction not found", 404));
+      }
+      if (getTxnStatus(latest) !== "pending") {
+        return next(
+          new ErrorHandler("This transaction was already reviewed", 400),
+        );
+      }
+      return res.status(409).json({
+        success: false,
+        message: "This transaction was changed. Please check it again.",
+        txn: serializeTxn(latest),
+      });
+    }
+
+    const reviewed: TxLike = updated;
     await syncChatLastTransaction(txn.chatId);
 
     const reviewerName = await getUserName(userId);
     const rejectMsg = rejectionRemark
-      ? `${reviewerName} rejected your Rs. ${txn.amount} transaction — "${rejectionRemark}"`
-      : `${reviewerName} rejected your Rs. ${txn.amount} transaction`;
+      ? `${reviewerName} rejected your Rs. ${reviewed.amount} transaction — "${rejectionRemark}"`
+      : `${reviewerName} rejected your Rs. ${reviewed.amount} transaction`;
     await sendPushNotification(
       txn.addedBy.toString(),
       action === "verify" ? "Transaction Verified" : "Transaction Rejected",
       action === "verify"
-        ? `Rs. ${txn.amount} verified by ${reviewerName}`
+        ? `Rs. ${reviewed.amount} verified by ${reviewerName}`
         : rejectMsg,
       {
         type: action === "verify" ? "txn_verified" : "txn_rejected",
@@ -357,7 +423,7 @@ export const reviewTxn = TryCatch(
         action === "verify"
           ? "Transaction verified successfully"
           : "Transaction rejected successfully",
-      txn: serializeTxn(txn.toObject()),
+      txn: serializeTxn(reviewed),
     });
   },
 );
