@@ -1,4 +1,13 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+  vi,
+} from "vitest";
 import request from "supertest";
 import "./mailbox.js";
 import { clearMailbox } from "./mailbox.js";
@@ -6,6 +15,7 @@ import app from "../src/app.js";
 import { Tx } from "../src/models/txModel.js";
 import { MonthlySummary } from "../src/models/monthlySummaryModel.js";
 import { Notification } from "../src/models/notificationModel.js";
+import { updateSummaryOnEdit } from "../src/services/summaryService.js";
 import {
   connect,
   disconnect,
@@ -26,6 +36,10 @@ afterAll(disconnect);
 let alice: TestUser;
 let bob: TestUser;
 let chatId: string;
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 beforeEach(async () => {
   await resetDb();
@@ -207,7 +221,7 @@ describe("editTxn — conflict detection", () => {
     expect(await summary()).toEqual({ sent: 1500, received: 1500, txCount: 1 });
   });
 
-  it("edit landing after a verify → 403", async () => {
+  it("edit landing after a verify (already verified when first read) → 403", async () => {
     const tx = await createTx(15000);
     await review(bob, tx._id, "verify").expect(200);
 
@@ -268,5 +282,205 @@ describe("editTxn — rejected transaction resubmit", () => {
     expect(
       await Notification.findOne({ recipient: bob.id, type: "txn_edited" }),
     ).toBeNull();
+  });
+});
+
+const del = (user: TestUser, txnId: string) =>
+  request(app)
+    .delete(`/api/v1/txns/deletetx/${txnId}`)
+    .set(auth(user.accessToken));
+
+/** Summary for the month containing `d` (server-local frame, like the service). */
+const summaryFor = async (d: Date) => {
+  const doc = (await MonthlySummary.findOne({
+    chatId,
+    year: d.getFullYear(),
+    month: d.getMonth() + 1,
+  }).lean()) as any;
+  return {
+    sent: doc?.members?.[alice.id]?.totalSent ?? 0,
+    received: doc?.members?.[bob.id]?.totalReceived ?? 0,
+    txCount: doc?.txCount ?? 0,
+  };
+};
+
+/** A date in the middle of the previous month. */
+const lastMonth = () => {
+  const n = new Date();
+  return new Date(n.getFullYear(), n.getMonth() - 1, 15, 12, 0, 0);
+};
+
+/** Move a pending tx (and its summary contribution) into last month. */
+const moveToLastMonth = async (txnId: string, amount: number) => {
+  const past = lastMonth();
+  const row = (await Tx.findById(txnId).lean()) as any;
+  await updateSummaryOnEdit(
+    chatId,
+    { date: row.date, from: alice.id, to: bob.id, amount },
+    { date: past, from: alice.id, to: bob.id, amount },
+  );
+  await Tx.collection.updateOne({ _id: row._id }, { $set: { date: past } });
+  return past;
+};
+
+/** Make the NEXT `Tx.findById` resolve to a stale snapshot (simulates a lost race). */
+const staleNextRead = (snapshot: unknown) => {
+  vi.spyOn(Tx, "findById").mockImplementationOnce(
+    (() => Promise.resolve(Tx.hydrate(snapshot as any))) as any,
+  );
+};
+
+describe("editTxn — delta comes from the matched pre-image", () => {
+  it("two concurrent pending edits without expectedUpdatedAt keep the summary equal to the stored amount", async () => {
+    const tx = await createTx(15000);
+
+    const [a, b] = await Promise.all([
+      edit(alice, tx._id, { amount: 1500 }),
+      edit(alice, tx._id, { amount: 2000 }),
+    ]);
+
+    expect([a.status, b.status]).toEqual([200, 200]);
+    const finalAmount = ((await Tx.findById(tx._id).lean()) as any).amount;
+    expect([1500, 2000]).toContain(finalAmount);
+    expect(await summary()).toEqual({
+      sent: finalAmount,
+      received: finalAmount,
+      txCount: 1,
+    });
+  });
+
+  it("an edit whose first read is stale still applies the delta from the stored amount", async () => {
+    const tx = await createTx(15000);
+    const snapshot = await Tx.findById(tx._id).lean(); // amount 15000
+    await edit(alice, tx._id, { amount: 1500 }).expect(200);
+
+    staleNextRead(snapshot); // the handler believes the amount is still 15000
+    await edit(alice, tx._id, { amount: 2000 }).expect(200);
+
+    expect(((await Tx.findById(tx._id).lean()) as any).amount).toBe(2000);
+    expect(await summary()).toEqual({ sent: 2000, received: 2000, txCount: 1 });
+  });
+});
+
+describe("editTxn — pending edits in a past month", () => {
+  it("amount edit with the date unchanged → 200 and that month's summary moves by the delta", async () => {
+    const tx = await createTx(15000);
+    const past = await moveToLastMonth(tx._id, 15000);
+    expect(await summaryFor(past)).toEqual({ sent: 15000, received: 15000, txCount: 1 });
+
+    const res = await edit(alice, tx._id, {
+      amount: 1500,
+      remarks: "fixed",
+      date: past.toISOString(),
+    }).expect(200);
+
+    expect(res.body.txn.amount).toBe(1500);
+    expect(await summaryFor(past)).toEqual({ sent: 1500, received: 1500, txCount: 1 });
+  });
+
+  it("amount edit that omits the date entirely → 200", async () => {
+    const tx = await createTx(15000);
+    const past = await moveToLastMonth(tx._id, 15000);
+
+    await edit(alice, tx._id, { amount: 700 }).expect(200);
+    expect(await summaryFor(past)).toEqual({ sent: 700, received: 700, txCount: 1 });
+  });
+
+  it("moving the date into a different closed month is still rejected with 400", async () => {
+    const tx = await createTx(15000);
+    const past = await moveToLastMonth(tx._id, 15000);
+    const older = new Date(past);
+    older.setMonth(older.getMonth() - 1);
+
+    await edit(alice, tx._id, { date: older.toISOString() }).expect(400);
+    expect(await summaryFor(past)).toEqual({ sent: 15000, received: 15000, txCount: 1 });
+  });
+});
+
+describe("editTxn — losing the race to a verify", () => {
+  it("edit that matches nothing because the tx was just verified → 409 with the latest txn", async () => {
+    const tx = await createTx(15000);
+    const snapshot = await Tx.findById(tx._id).lean(); // still pending
+    await review(bob, tx._id, "verify").expect(200);
+
+    staleNextRead(snapshot);
+    const res = await edit(alice, tx._id, { amount: 1500 }).expect(409);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.message).toBe(
+      "This transaction was just verified, so it can't be edited.",
+    );
+    expect(res.body.txn.status).toBe("verified");
+    expect(res.body.txn.amount).toBe(15000);
+    expect(await summary()).toEqual({ sent: 15000, received: 15000, txCount: 1 });
+  });
+});
+
+describe("deleteTxn — atomic delete", () => {
+  const rejectedTx = async (amount = 1000) => {
+    const tx = await createTx(amount);
+    await review(bob, tx._id, "reject", { remark: "no" }).expect(200);
+    return tx;
+  };
+
+  it("deletes a rejected transaction (happy path)", async () => {
+    const tx = await rejectedTx();
+    await del(alice, tx._id).expect(200);
+    expect(await Tx.findById(tx._id)).toBeNull();
+    expect(await summary()).toEqual({ sent: 0, received: 0, txCount: 0 });
+  });
+
+  it("delete racing a resubmit leaves the summary consistent with what remains", async () => {
+    const keep = await createTx(500);
+    const tx = await rejectedTx(1000);
+
+    const [d, e] = await Promise.all([
+      del(alice, tx._id),
+      edit(alice, tx._id, { amount: 2000 }),
+    ]);
+
+    expect([200, 404, 409]).toContain(d.status);
+    expect([200, 404]).toContain(e.status);
+    const remaining = (await Tx.find({
+      chatId,
+      status: { $ne: "rejected" },
+    }).lean()) as any[];
+    const total = remaining.reduce((n, t) => n + t.amount, 0);
+    expect(remaining.some((t) => String(t._id) === keep._id)).toBe(true);
+    expect(await summary()).toEqual({
+      sent: total,
+      received: total,
+      txCount: remaining.length,
+    });
+  });
+
+  it("delete that lost to a resubmit (stale rejected read) → 409 with the latest txn, tx kept", async () => {
+    const tx = await rejectedTx(1000);
+    const snapshot = await Tx.findById(tx._id).lean(); // rejected
+    await edit(alice, tx._id, { amount: 2000 }).expect(200);
+
+    staleNextRead(snapshot);
+    const res = await del(alice, tx._id).expect(409);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.txn.status).toBe("pending");
+    expect(res.body.txn.amount).toBe(2000);
+    expect(await Tx.findById(tx._id)).not.toBeNull();
+    expect(await summary()).toEqual({ sent: 2000, received: 2000, txCount: 1 });
+  });
+
+  it("delete of a row that vanished after the first read → 404", async () => {
+    const tx = await rejectedTx();
+    const snapshot = await Tx.findById(tx._id).lean();
+    await Tx.deleteOne({ _id: tx._id });
+
+    staleNextRead(snapshot);
+    await del(alice, tx._id).expect(404);
+  });
+
+  it("non-creator → 403 and the row is untouched", async () => {
+    const tx = await rejectedTx();
+    await del(bob, tx._id).expect(403);
+    expect(await Tx.findById(tx._id)).not.toBeNull();
   });
 });

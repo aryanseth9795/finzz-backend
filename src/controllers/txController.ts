@@ -327,6 +327,23 @@ export const reviewTxn = TryCatch(
     };
     if (expectedUpdatedAt !== undefined) {
       filter.updatedAt = new Date(expectedUpdatedAt);
+    } else if (action === "verify") {
+      /**
+       * An old build sends no `expectedUpdatedAt`, so it cannot prove which
+       * version it showed the reviewer. It may still verify a row the creator
+       * never edited, but never one that has been edited (it may be approving
+       * an amount it never saw). The filter also covers an edit that lands
+       * after the read above.
+       */
+      if (txn.editedAt) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "This transaction was edited. Please refresh (or update the app) and check it again.",
+          txn: serializeTxn(txn.toObject() as TxLike),
+        });
+      }
+      filter.editedAt = null;
     }
 
     const now = new Date();
@@ -385,9 +402,11 @@ export const reviewTxn = TryCatch(
         return next(new ErrorHandler("Transaction not found", 404));
       }
       if (getTxnStatus(latest) !== "pending") {
-        return next(
-          new ErrorHandler("This transaction was already reviewed", 400),
-        );
+        return res.status(400).json({
+          success: false,
+          message: "This transaction was already reviewed",
+          txn: serializeTxn(latest),
+        });
       }
       return res.status(409).json({
         success: false,
@@ -488,7 +507,10 @@ export const editTxn = TryCatch(
     // Guard: cannot move the date to a closed month (same rule as add).
     // `tzOffsetMinutes` is stripped by the zod schema, so this is effectively
     // UTC, exactly as `addtxns` behaves today.
-    if (date !== undefined) {
+    // Only a CHANGED date is checked: a pending row dated in an earlier month
+    // may still have its amount, remarks or direction fixed (it was never
+    // verified, so its month total moving by the delta is correct).
+    if (date !== undefined && target.date.getTime() !== old.date.getTime()) {
       ensureCurrentMonth(
         target.date,
         "Cannot move transactions to closed months.",
@@ -517,25 +539,32 @@ export const editTxn = TryCatch(
       filter.updatedAt = new Date(expectedUpdatedAt);
     }
 
+    // Only the fields the client sent are written, so a concurrent edit of a
+    // different field is not overwritten with this request's stale read.
     const $set: Record<string, unknown> = {
-      amount: target.amount,
-      date: target.date,
-      from: target.from,
-      to: target.to,
       editedAt: now,
       status: "pending",
       verified: false,
     };
-    if (target.remarks !== undefined) $set.remarks = target.remarks;
+    if (amount !== undefined) $set.amount = target.amount;
+    if (date !== undefined) $set.date = target.date;
+    if (from !== undefined) $set.from = target.from;
+    if (to !== undefined) $set.to = target.to;
+    if (remarks !== undefined) $set.remarks = target.remarks;
 
     let updated: TxLike | null = null;
+    let applied = old;
+    let appliedTarget = target;
     const session = await mongoose.startSession();
     try {
       await session.withTransaction(async () => {
         // The callback can be retried on a transient error.
         updated = null;
 
-        updated = await Tx.findOneAndUpdate(
+        // `new: false` returns the PRE-image of the row this update matched.
+        // The summary delta is computed from it, never from the earlier
+        // unlocked read, so concurrent edits cannot corrupt the month total.
+        const pre = await Tx.findOneAndUpdate(
           filter,
           {
             $set,
@@ -548,24 +577,43 @@ export const editTxn = TryCatch(
               verifiedAt: "",
             },
           },
-          { new: true, session },
+          { new: false, session },
         ).lean<TxLike | null>();
 
-        if (!updated) return;
+        if (!pre) return;
+
+        applied = {
+          amount: pre.amount as number,
+          date: new Date(pre.date as Date),
+          remarks: pre.remarks,
+          from: String(pre.from),
+          to: String(pre.to),
+        };
+        appliedTarget = {
+          amount: amount !== undefined ? (amount as number) : applied.amount,
+          date: date !== undefined ? new Date(date) : applied.date,
+          remarks: remarks !== undefined ? (remarks as string) : applied.remarks,
+          from: from !== undefined ? String(from) : applied.from,
+          to: to !== undefined ? String(to) : applied.to,
+        };
 
         if (oldStatus === "pending") {
-          await updateSummaryOnEdit(txn.chatId, old, target, session);
+          await updateSummaryOnEdit(txn.chatId, applied, appliedTarget, session);
         } else {
           // Rejected: the reject already removed it from the summary.
           await updateSummaryOnAdd(
             txn.chatId,
-            target.date,
-            target.from,
-            target.to,
-            target.amount,
+            appliedTarget.date,
+            appliedTarget.from,
+            appliedTarget.to,
+            appliedTarget.amount,
             session,
           );
         }
+
+        updated = await Tx.findById(pre._id)
+          .session(session)
+          .lean<TxLike | null>();
       });
     } finally {
       await session.endSession();
@@ -583,9 +631,11 @@ export const editTxn = TryCatch(
         );
       }
       if (getTxnStatus(latest) === "verified") {
-        return next(
-          new ErrorHandler("Cannot edit a verified transaction", 403),
-        );
+        return res.status(409).json({
+          success: false,
+          message: "This transaction was just verified, so it can't be edited.",
+          txn: serializeTxn(latest),
+        });
       }
       return res.status(409).json({
         success: false,
@@ -605,8 +655,8 @@ export const editTxn = TryCatch(
         await sendPushNotification(
           otherMemberId,
           "Transaction Edited",
-          target.amount !== old.amount
-            ? `${senderName} edited a pending transaction: Rs. ${old.amount} → Rs. ${target.amount}`
+          appliedTarget.amount !== applied.amount
+            ? `${senderName} edited a pending transaction: Rs. ${applied.amount} → Rs. ${appliedTarget.amount}`
             : `${senderName} edited a pending transaction`,
           {
             type: "txn_edited",
@@ -619,7 +669,7 @@ export const editTxn = TryCatch(
         await sendPushNotification(
           otherMemberId,
           "Transaction Resubmitted",
-          `${senderName} resubmitted Rs. ${target.amount} for review`,
+          `${senderName} resubmitted Rs. ${appliedTarget.amount} for review`,
           {
             type: "txn_reworked",
             senderId: userId,
@@ -678,8 +728,32 @@ export const deleteTxn = TryCatch(
     const chatId = txn.chatId;
 
     // Do NOT call updateSummaryOnDelete — the reject flow already rolled back the balance.
-    // Simply remove the document.
-    await Tx.findByIdAndDelete(txnId);
+    // Remove the document atomically, only while it is still rejected and ours:
+    // a resubmit that lands after the read above has re-added it to the
+    // summary, and deleting it then would leave the totals counting a row that
+    // no longer exists.
+    const deleted = await Tx.findOneAndDelete({
+      _id: txn._id,
+      addedBy: userId,
+      status: "rejected",
+    }).lean<TxLike | null>();
+
+    if (!deleted) {
+      const latest = await Tx.findById(txnId).lean<TxLike | null>();
+      if (!latest) {
+        return next(new ErrorHandler("Transaction not found", 404));
+      }
+      if (latest.addedBy?.toString() !== userId) {
+        return next(
+          new ErrorHandler("You can only delete your own transactions", 403),
+        );
+      }
+      return res.status(409).json({
+        success: false,
+        message: "This transaction was changed, so it can't be deleted.",
+        txn: serializeTxn(latest),
+      });
+    }
 
     await syncChatLastTransaction(chatId);
 

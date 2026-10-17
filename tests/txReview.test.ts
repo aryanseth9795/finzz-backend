@@ -1,4 +1,13 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+  vi,
+} from "vitest";
 import request from "supertest";
 import "./mailbox.js";
 import { clearMailbox } from "./mailbox.js";
@@ -25,6 +34,10 @@ afterAll(disconnect);
 let alice: TestUser;
 let bob: TestUser;
 let chatId: string;
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 beforeEach(async () => {
   await resetDb();
@@ -135,12 +148,69 @@ describe("reviewTxn — expectedUpdatedAt", () => {
     expect(await summary()).toEqual({ sent: 15000, received: 15000, txCount: 1 });
   });
 
-  it("verify without expectedUpdatedAt still works (old builds)", async () => {
+  it("verify without expectedUpdatedAt still works for an unedited tx (old builds)", async () => {
     const tx = await createTx(15000);
-    await edit(alice, tx._id, { amount: 1500 }).expect(200);
 
     await review(bob, tx._id, "verify").expect(200);
     expect((await stored(tx._id)).status).toBe("verified");
+  });
+
+  it("verify without expectedUpdatedAt on an EDITED tx → 409 with the latest txn, not verified", async () => {
+    const tx = await createTx(15000);
+    await edit(alice, tx._id, { amount: 1500 }).expect(200);
+
+    const res = await review(bob, tx._id, "verify").expect(409);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.message).toBe(
+      "This transaction was edited. Please refresh (or update the app) and check it again.",
+    );
+    expect(res.body.txn.amount).toBe(1500);
+    expect(res.body.txn.status).toBe("pending");
+    const s = await stored(tx._id);
+    expect(s.status).toBe("pending");
+    expect(s.verifiedBy).toBeUndefined();
+  });
+
+  it("verify with the current expectedUpdatedAt on an edited tx works", async () => {
+    const tx = await createTx(15000);
+    const edited = await edit(alice, tx._id, { amount: 1500 }).expect(200);
+
+    await review(bob, tx._id, "verify", {
+      expectedUpdatedAt: edited.body.txn.updatedAt,
+    }).expect(200);
+    expect((await stored(tx._id)).status).toBe("verified");
+  });
+
+  it("an edit that lands between the read and the verify (no expectedUpdatedAt) is not verified", async () => {
+    const tx = await createTx(15000);
+    const snapshot = await Tx.findById(tx._id).lean(); // unedited
+    await edit(alice, tx._id, { amount: 1500 }).expect(200);
+
+    vi.spyOn(Tx, "findById").mockImplementationOnce(
+      (() => Promise.resolve(Tx.hydrate(snapshot as any))) as any,
+    );
+    const res = await review(bob, tx._id, "verify").expect(409);
+
+    expect(res.body.txn.amount).toBe(1500);
+    expect((await stored(tx._id)).status).toBe("pending");
+  });
+
+  it("already reviewed (lost the race) → 400 including the latest txn", async () => {
+    const tx = await createTx(15000);
+    const snapshot = await Tx.findById(tx._id).lean(); // still pending
+    await review(bob, tx._id, "reject", { remark: "no" }).expect(200);
+
+    vi.spyOn(Tx, "findById").mockImplementationOnce(
+      (() => Promise.resolve(Tx.hydrate(snapshot as any))) as any,
+    );
+    const res = await review(bob, tx._id, "reject", { remark: "again" }).expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.message).toBe("This transaction was already reviewed");
+    expect(res.body.txn.status).toBe("rejected");
+    expect(res.body.txn.amount).toBe(15000);
+    expect(await summary()).toEqual({ sent: 0, received: 0, txCount: 0 });
   });
 
   it("reject removes the txn from the summary using the stored values", async () => {
