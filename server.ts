@@ -9,6 +9,7 @@ import {
   isProduction,
 } from "./src/config/envVariables.js";
 import connectDb from "./src/db/db.js";
+import { startActivityFlush } from "./src/services/activityTracker.js";
 
 /**
  * Process bootstrap. The Express application itself lives in `src/app.ts` and
@@ -52,6 +53,9 @@ const start = async () => {
   // failed with confusing errors instead of the process failing loudly.
   await connectDb(MongoURL);
 
+  // Persist the buffered traffic counts every 30 s (the timer is unref'd).
+  const stopActivityFlush = startActivityFlush();
+
   const server = app.listen(PORT, () => {
     console.log(
       `Server listening on port ${PORT} (${isProduction ? "production" : "development"})`,
@@ -67,6 +71,7 @@ const start = async () => {
   const shutdown = async (signal: string) => {
     console.log(`[shutdown] ${signal} received, closing gracefully…`);
     if (pingTimer) clearInterval(pingTimer);
+    stopActivityFlush();
 
     server.close(async () => {
       try {

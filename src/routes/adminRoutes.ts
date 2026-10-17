@@ -8,6 +8,7 @@ import {
   adminIdParamSchema,
   adminExpenseQuerySchema,
   adminPoolQuerySchema,
+  adminTrafficQuerySchema,
   bulkNotificationSchema,
   targetedNotificationSchema,
   appReleaseSchema,
@@ -17,6 +18,7 @@ import {
   adminLogout,
   adminVerify,
   getDashboardStats,
+  getTrafficAnalytics,
   getAllUsers,
   getUserDetail,
   deleteUser,
@@ -57,6 +59,12 @@ router.get("/verify", adminOnly, adminVerify);
 router.get("/logout", adminOnly, adminLogout);
 router.post("/logout", adminOnly, adminLogout);
 router.get("/dashboard", adminOnly, getDashboardStats);
+router.get(
+  "/analytics/traffic",
+  adminOnly,
+  validate(adminTrafficQuerySchema),
+  getTrafficAnalytics,
+);
 
 // Users
 router.get(

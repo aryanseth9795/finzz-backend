@@ -496,6 +496,12 @@ export const adminPoolQuerySchema = z.object({
   }),
 });
 
+export const adminTrafficQuerySchema = z.object({
+  query: z.object({
+    days: z.coerce.number().int().min(1).max(90).default(30),
+  }),
+});
+
 export const bulkNotificationSchema = z.object({
   body: z.object({
     title: z.string().trim().min(1, "Title is required").max(100),
