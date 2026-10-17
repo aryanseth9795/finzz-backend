@@ -17,6 +17,8 @@ export interface ITx extends Document {
   rejectedBy?: mongoose.Types.ObjectId;
   rejectedAt?: Date;
   rejectionRemark?: string;
+  editedAt?: Date;
+  editCount: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -89,6 +91,14 @@ const txSchema = new Schema<ITx>(
     rejectionRemark: {
       type: String,
       trim: true,
+    },
+    editedAt: {
+      type: Date,
+    },
+    editCount: {
+      type: Number,
+      default: 0,
+      min: 0,
     },
   },
   {

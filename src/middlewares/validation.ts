@@ -103,6 +103,7 @@ export const editTxnSchema = z.object({
     remarks: shortText(200, "Remarks").optional(),
     to: objectId.optional(),
     from: objectId.optional(),
+    expectedUpdatedAt: isoDate.optional(),
   }),
 });
 
@@ -116,7 +117,7 @@ export const getTxnsSchema = z.object({
 });
 
 export const verifyTxnSchema = z.object({
-  body: z.object({ txnId: objectId }),
+  body: z.object({ txnId: objectId, expectedUpdatedAt: isoDate.optional() }),
 });
 
 export const reviewTxnSchema = z.object({
@@ -124,6 +125,7 @@ export const reviewTxnSchema = z.object({
     txnId: z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid txnId"),
     action: z.enum(["verify", "reject"]).default("verify"),
     remark: z.string().max(200, "Remark too long").optional(),
+    expectedUpdatedAt: isoDate.optional(),
   }),
 });
 

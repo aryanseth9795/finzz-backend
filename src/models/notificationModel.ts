@@ -11,6 +11,7 @@ export interface INotification extends Document {
     | "txn_rejected"
     | "txn_reworked"
     | "txn_deleted"
+    | "txn_edited"
     | "pool_tx_added"
     | "pool_tx_verified"
     | "pool_member_added"
@@ -47,6 +48,7 @@ const notificationSchema = new Schema<INotification>(
         "txn_rejected",
         "txn_reworked",
         "txn_deleted",
+        "txn_edited",
         "pool_tx_added",
         "pool_tx_verified",
         "pool_member_added",
