@@ -63,9 +63,8 @@ const mkTx = (o: {
 
 /**
  * Write a monthly summary row for a chosen (year, month) bucket, shaped exactly
- * as updateSummaryOnAdd would. Written directly because updateSummaryOnAdd
- * buckets by the SERVER's local calendar, which would make these tests depend
- * on the machine's timezone.
+ * as updateSummaryOnAdd would. The report must NOT read these rows (they are
+ * bucketed in server-local time); tests write them to prove it ignores them.
  */
 const summary = async (
   year: number,
@@ -128,7 +127,15 @@ describe("buildChatReportData: period and people", () => {
     });
     expect(r.byStatus.pending).toEqual({ count: 0, amount: 0 });
     expect(r.previousMonth).toBeNull();
-    expect(r.trend).toEqual([]);
+    expect(r.trend.map((t) => `${t.year}-${t.month}`)).toEqual([
+      "2026-5",
+      "2026-6",
+      "2026-7",
+      "2026-8",
+      "2026-9",
+      "2026-10",
+    ]);
+    expect(r.trend.every((t) => t.gave === 0 && t.received === 0 && t.net === 0)).toBe(true);
   });
 });
 
@@ -231,8 +238,7 @@ describe("buildChatReportData: status handling", () => {
 describe("buildChatReportData: balances (positive = friend owes viewer)", () => {
   it("worked example: gave 1000, received 400 on top of an opening balance", async () => {
     // September: Alice gave 200, so Bob owes Alice 200 and the opening is +200.
-    // getCarryForward reports received - sent = -200 for Alice: the opposite sign.
-    await summary(2026, 9, 200, 0);
+    await mkTx({ gave: "alice", amount: 200, date: "2026-09-10T10:00:00Z" });
 
     await mkTx({ gave: "alice", amount: 1000, date: "2026-10-02T10:00:00Z", status: "verified" });
     await mkTx({ gave: "bob", amount: 400, date: "2026-10-03T10:00:00Z", status: "verified" });
@@ -251,14 +257,15 @@ describe("buildChatReportData: balances (positive = friend owes viewer)", () => 
   });
 
   it("a negative opening balance means the viewer owes the friend", async () => {
-    await summary(2026, 9, 0, 300); // Bob gave 300 in September
+    await mkTx({ gave: "bob", amount: 300, date: "2026-09-10T10:00:00Z" }); // Bob gave 300 in September
     const r = await build(2026, 10);
     expect(r.openingBalance).toBe(-300);
     expect(r.closingBalance).toBe(-300);
   });
 
   it("the friend's view of the same chat is the mirror image", async () => {
-    await summary(2026, 9, 200, 50);
+    await mkTx({ gave: "alice", amount: 200, date: "2026-09-10T10:00:00Z" });
+    await mkTx({ gave: "bob", amount: 50, date: "2026-09-11T10:00:00Z" });
     const a = await build(2026, 10);
     const b = await buildChatReportData({
       chatId,
@@ -331,44 +338,149 @@ describe("buildChatReportData: daily and weekday", () => {
 });
 
 describe("buildChatReportData: previous month and trend", () => {
-  it("previousMonth is null when there is no summary, or it is all zero", async () => {
+  it("previousMonth is null when last month has no rows, or only rejected ones", async () => {
     expect((await build(2026, 10)).previousMonth).toBeNull();
-    await summary(2026, 9, 0, 0, 0);
+    await mkTx({ gave: "alice", amount: 40, date: "2026-09-10T10:00:00Z", status: "rejected" });
     expect((await build(2026, 10)).previousMonth).toBeNull();
   });
 
-  it("previousMonth reads the viewer's side of last month's summary", async () => {
-    await summary(2026, 9, 500, 200, 3);
+  it("previousMonth reads the viewer's side of last month's rows", async () => {
+    await mkTx({ gave: "alice", amount: 300, date: "2026-09-05T10:00:00Z" });
+    await mkTx({ gave: "alice", amount: 200, date: "2026-09-06T10:00:00Z", status: "verified" });
+    await mkTx({ gave: "bob", amount: 200, date: "2026-09-07T10:00:00Z" });
     const r = await build(2026, 10);
     expect(r.previousMonth).toEqual({ gave: 500, received: 200, net: -300, count: 3 });
   });
 
   it("previousMonth wraps across the year boundary", async () => {
-    await summary(2025, 12, 10, 40, 2);
+    await mkTx({ gave: "alice", amount: 10, date: "2025-12-10T10:00:00Z" });
+    await mkTx({ gave: "bob", amount: 40, date: "2025-12-11T10:00:00Z" });
     const r = await build(2026, 1);
     expect(r.previousMonth).toEqual({ gave: 10, received: 40, net: 30, count: 2 });
   });
 
-  it("trend is oldest first, ends with this month, and omits months without a summary", async () => {
-    await summary(2026, 7, 100, 0);
-    await summary(2026, 9, 50, 150);
-    await summary(2026, 10, 0, 25);
-    await summary(2026, 11, 999, 999); // future: must not appear
-    await summary(2026, 1, 1, 1); // older than six months: must not appear
+  it("previousMonth is bucketed in the user's timezone", async () => {
+    // 1 Sep 00:30 IST (31 Aug UTC) and 1 Oct 00:30 IST (30 Sep UTC).
+    await mkTx({ gave: "alice", amount: 100, date: "2026-08-31T19:00:00Z" });
+    await mkTx({ gave: "alice", amount: 7, date: "2026-09-30T19:00:00Z" });
+
+    const ist = await build(2026, 10, 330);
+    expect(ist.previousMonth).toEqual({ gave: 100, received: 0, net: -100, count: 1 });
+    expect(ist.openingBalance).toBe(100);
+    expect(ist.ledger.map((l) => l.amount)).toEqual([7]);
+
+    const utc = await build(2026, 10, 0);
+    expect(utc.previousMonth).toEqual({ gave: 7, received: 0, net: -7, count: 1 });
+    expect(utc.openingBalance).toBe(107);
+    expect(utc.ledger).toHaveLength(0);
+  });
+
+  it("trend is six consecutive months, oldest first, zero-filled, ending with this month", async () => {
+    await mkTx({ gave: "alice", amount: 100, date: "2026-07-10T10:00:00Z" });
+    await mkTx({ gave: "alice", amount: 50, date: "2026-09-10T10:00:00Z" });
+    await mkTx({ gave: "bob", amount: 150, date: "2026-09-11T10:00:00Z" });
+    await mkTx({ gave: "bob", amount: 25, date: "2026-10-10T10:00:00Z" });
+    await mkTx({ gave: "alice", amount: 999, date: "2026-11-10T10:00:00Z" }); // future
+    await mkTx({ gave: "alice", amount: 1, date: "2026-04-10T10:00:00Z" }); // older than six months
+    await mkTx({ gave: "alice", amount: 77, date: "2026-08-10T10:00:00Z", status: "rejected" });
 
     const r = await build(2026, 10);
     expect(r.trend).toEqual([
+      { year: 2026, month: 5, label: "May", gave: 0, received: 0, net: 0 },
+      { year: 2026, month: 6, label: "Jun", gave: 0, received: 0, net: 0 },
       { year: 2026, month: 7, label: "Jul", gave: 100, received: 0, net: -100 },
+      { year: 2026, month: 8, label: "Aug", gave: 0, received: 0, net: 0 },
       { year: 2026, month: 9, label: "Sep", gave: 50, received: 150, net: 100 },
       { year: 2026, month: 10, label: "Oct", gave: 0, received: 25, net: 25 },
     ]);
   });
 
   it("trend window crosses a year boundary", async () => {
-    await summary(2025, 11, 5, 0);
-    await summary(2026, 2, 0, 5);
+    await mkTx({ gave: "alice", amount: 5, date: "2025-11-10T10:00:00Z" });
+    await mkTx({ gave: "bob", amount: 5, date: "2026-02-10T10:00:00Z" });
     const r = await build(2026, 2);
-    expect(r.trend.map((t) => `${t.year}-${t.month}`)).toEqual(["2025-11", "2026-2"]);
+    expect(r.trend.map((t) => `${t.year}-${t.month}`)).toEqual([
+      "2025-9",
+      "2025-10",
+      "2025-11",
+      "2025-12",
+      "2026-1",
+      "2026-2",
+    ]);
+    expect(r.trend[2].gave).toBe(5);
+    expect(r.trend[5].received).toBe(5);
+  });
+
+  it("trend months follow the user's timezone", async () => {
+    await mkTx({ gave: "alice", amount: 7, date: "2026-09-30T19:00:00Z" });
+    const ist = await build(2026, 10, 330);
+    expect(ist.trend[5]).toMatchObject({ month: 10, gave: 7 });
+    expect(ist.trend[4]).toMatchObject({ month: 9, gave: 0 });
+    const utc = await build(2026, 10, 0);
+    expect(utc.trend[4]).toMatchObject({ month: 9, gave: 7 });
+    expect(utc.trend[5]).toMatchObject({ month: 10, gave: 0 });
+  });
+});
+
+describe("buildChatReportData: one source for opening balance and ledger", () => {
+  it("does not double count a legacy-dated 1st that a summary bucketed into the previous month", async () => {
+    // Old app builds stored "1 Oct" as 2026-09-30T18:30Z; the summary landed in September.
+    await mkTx({ gave: "alice", amount: 15000, date: "2026-09-30T18:30:00Z" });
+    await summary(2026, 9, 15000, 0);
+
+    const r = await build(2026, 10, 330);
+    expect(r.ledger.map((l) => l.amount)).toEqual([15000]);
+    expect(r.openingBalance).toBe(0);
+    expect(r.closingBalance).toBe(15000);
+    expect(r.closingBalance).toBe(r.openingBalance + 15000);
+    expect(r.totals.gave).toBe(15000);
+  });
+
+  it("negative offset: nothing is dropped from opening or ledger, summaries are ignored", async () => {
+    // tz -300: October starts at 2026-10-01T05:00Z. A tx at 03:00Z is still 30 Sep locally.
+    await mkTx({ gave: "alice", amount: 40, date: "2026-10-01T03:00:00Z" });
+    await mkTx({ gave: "alice", amount: 2, date: "2026-10-01T05:00:00Z" });
+    // A summary bucketed into October (server-local UTC) must be ignored.
+    await summary(2026, 10, 40, 0);
+
+    const r = await build(2026, 10, -300);
+    expect(r.openingBalance).toBe(40);
+    expect(r.ledger.map((l) => l.amount)).toEqual([2]);
+    expect(r.closingBalance).toBe(42);
+  });
+
+  it("opening balance covers all earlier non-rejected movement, including legacy rows", async () => {
+    await mkTx({ gave: "alice", amount: 500, date: "2026-07-10T10:00:00Z", status: "verified" });
+    await mkTx({ gave: "bob", amount: 120, date: "2026-08-12T10:00:00Z" });
+    await mkTx({ gave: "alice", amount: 9999, date: "2026-08-15T10:00:00Z", status: "rejected" });
+    await mkTx({ gave: "bob", amount: 0.1, date: "2026-09-01T10:00:00Z" });
+    await mkTx({ gave: "bob", amount: 0.2, date: "2026-09-02T10:00:00Z" });
+    // Legacy verified row with no status field.
+    await Tx.collection.insertOne({
+      chatId: new mongoose.Types.ObjectId(chatId),
+      from: new mongoose.Types.ObjectId(alice.id),
+      to: new mongoose.Types.ObjectId(bob.id),
+      addedBy: new mongoose.Types.ObjectId(alice.id),
+      amount: 30,
+      date: new Date("2026-09-20T10:00:00Z"),
+      verified: true,
+    });
+    // Later movement must not count towards the opening balance.
+    await mkTx({ gave: "alice", amount: 1000, date: "2026-10-05T10:00:00Z" });
+
+    const r = await build(2026, 10, 330);
+    expect(r.openingBalance).toBe(409.7); // 500 - 120 - 0.1 - 0.2 + 30
+    expect(r.closingBalance).toBe(1409.7);
+    expect(r.ledger[0].runningBalance).toBe(1409.7);
+
+    const b = await buildChatReportData({
+      chatId,
+      viewerId: bob.id,
+      year: 2026,
+      month: 10,
+      tzOffsetMinutes: 330,
+    });
+    expect(b.openingBalance).toBe(-409.7);
   });
 });
 

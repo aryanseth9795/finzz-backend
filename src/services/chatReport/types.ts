@@ -113,10 +113,10 @@ export interface ChatReportData {
   /** Seven entries, index = weekday (0 = Sunday); non-rejected only. */
   weekday: { weekday: number; amount: number; count: number }[];
 
-  /** The month before, when it has any activity; null otherwise. */
+  /** The month before (from Tx, viewer timezone), or null when it has no non-rejected rows. */
   previousMonth: { gave: number; received: number; net: number; count: number } | null;
 
-  /** Up to 6 months ending with this one, oldest first, from the monthly summaries. */
+  /** Exactly 6 consecutive months ending with this one, oldest first, computed from Tx in the viewer timezone; zero-filled. */
   trend: ReportMonthNet[];
 }
 

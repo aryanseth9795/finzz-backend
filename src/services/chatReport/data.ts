@@ -1,7 +1,6 @@
+import mongoose from "mongoose";
 import { Chat } from "../../models/chatModel.js";
 import { Tx } from "../../models/txModel.js";
-import { MonthlySummary } from "../../models/monthlySummaryModel.js";
-import { getCarryForward } from "../summaryService.js";
 import { daysInMonth as daysIn, monthRangeUtc } from "../../utils/dates.js";
 import type {
   ChatReportData,
@@ -44,23 +43,18 @@ interface RawTx {
   verified?: boolean;
 }
 
-interface SummaryRow {
-  year: number;
-  month: number;
-  txCount?: number;
-  members?: Map<string, MemberStats> | Record<string, MemberStats>;
-}
-
-interface MemberStats {
-  totalSent?: number;
-  totalReceived?: number;
-}
-
-const memberStats = (row: SummaryRow | undefined, userId: string): MemberStats | undefined => {
-  const members = row?.members;
-  if (!members) return undefined;
-  return members instanceof Map ? members.get(userId) : members[userId];
+/** "+05:30" / "-03:00": the form Mongo's `timezone` option accepts for a fixed offset. */
+const tzString = (tzOffsetMinutes: number): string => {
+  const sign = tzOffsetMinutes < 0 ? "-" : "+";
+  const abs = Math.abs(tzOffsetMinutes);
+  return `${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
 };
+
+interface MonthAgg {
+  gave: number;
+  received: number;
+  count: number;
+}
 
 /**
  * Everything the monthly chat report shows, computed once and in one place.
@@ -68,9 +62,11 @@ const memberStats = (row: SummaryRow | undefined, userId: string): MemberStats |
  * Balance convention (see types.ts): POSITIVE = the friend owes the viewer.
  *  - A "gave" row (viewer paid the friend) increases what the friend owes: +amount.
  *  - A "received" row decreases it: -amount.
- *  - `getCarryForward` returns received - sent per user, which is the OPPOSITE
- *    sign (positive = that user has received more, i.e. owes more). The opening
- *    balance is therefore its negation.
+ *
+ * One source of truth: the opening balance, the previous month and the trend
+ * are all computed from Tx with the SAME timezone-aware boundaries as the
+ * ledger. MonthlySummary rows are bucketed in server-local time, so reading
+ * them here would double count (or drop) rows near a month boundary.
  */
 export async function buildChatReportData(opts: {
   chatId: string;
@@ -103,9 +99,22 @@ export async function buildChatReportData(opts: {
     .sort({ date: 1, _id: 1 })
     .lean<RawTx[]>();
 
-  // getCarryForward is received - sent, the opposite of the report convention.
-  const carry = await getCarryForward(chatId, year, month);
-  const openingBalance = r2(-(carry[viewerId] ?? 0)) + 0; // "+ 0" turns -0 into 0
+  const chatOid = new mongoose.Types.ObjectId(chatId);
+  const viewerOid = new mongoose.Types.ObjectId(viewerId);
+  const isViewerGave = { $eq: ["$from", viewerOid] };
+
+  // Everything before the period's first instant, non-rejected only (a legacy
+  // row with no status counts). Positive = the friend owes the viewer.
+  const [openingAgg] = await Tx.aggregate<{ net: number }>([
+    { $match: { chatId: chatOid, date: { $lt: start }, status: { $ne: "rejected" } } },
+    {
+      $group: {
+        _id: null,
+        net: { $sum: { $cond: [isViewerGave, "$amount", { $multiply: ["$amount", -1] }] } },
+      },
+    },
+  ]);
+  const openingBalance = r2(openingAgg?.net ?? 0) + 0; // "+ 0" turns -0 into 0
 
   let running = openingBalance;
   let gave = 0;
@@ -180,54 +189,61 @@ export async function buildChatReportData(opts: {
     });
   }
 
-  // Previous month plus the trend window, in one query.
+  // Trend window (this month and the five before it, oldest first) plus the
+  // previous month, from one aggregate on Tx bucketed in the user's timezone.
   const window: { year: number; month: number }[] = [];
   for (let i = TREND_MONTHS - 1; i >= 0; i--) {
     const idx = year * 12 + (month - 1) - i;
     window.push({ year: Math.floor(idx / 12), month: (idx % 12) + 1 });
   }
-  const prev = (() => {
-    const idx = year * 12 + (month - 1) - 1;
-    return { year: Math.floor(idx / 12), month: (idx % 12) + 1 };
-  })();
-  const summaries = await MonthlySummary.find({
-    chatId,
-    $or: window.map((w) => ({ year: w.year, month: w.month })),
-  }).lean<SummaryRow[]>();
-  const summaryAt = (y: number, m: number) =>
-    summaries.find((s) => s.year === y && s.month === m);
+  const windowStart = monthRangeUtc(window[0].year, window[0].month, tzOffsetMinutes).start;
+  const parts = { $dateToParts: { date: "$date", timezone: tzString(tzOffsetMinutes) } };
+  const monthRows = await Tx.aggregate<{ _id: { year: number; month: number } } & MonthAgg>([
+    {
+      $match: {
+        chatId: chatOid,
+        date: { $gte: windowStart, $lt: end },
+        status: { $ne: "rejected" },
+      },
+    },
+    { $addFields: { parts } },
+    {
+      $group: {
+        _id: { year: "$parts.year", month: "$parts.month" },
+        gave: { $sum: { $cond: [isViewerGave, "$amount", 0] } },
+        received: { $sum: { $cond: [isViewerGave, 0, "$amount"] } },
+        count: { $sum: 1 },
+      },
+    },
+  ]);
+  const monthAt = (y: number, m: number): MonthAgg | undefined =>
+    monthRows.find((row) => row._id.year === y && row._id.month === m);
 
-  const prevRow = summaryAt(prev.year, prev.month);
-  const prevStats = memberStats(prevRow, viewerId);
-  const prevGave = r2(prevStats?.totalSent ?? 0);
-  const prevReceived = r2(prevStats?.totalReceived ?? 0);
-  const prevCount = prevRow?.txCount ?? 0;
-  const previousMonth =
-    prevRow && (prevGave !== 0 || prevReceived !== 0)
-      ? {
-          gave: prevGave,
-          received: prevReceived,
-          net: r2(prevReceived - prevGave),
-          count: Math.max(prevCount, 0),
-        }
-      : null;
-
-  const trend: ReportMonthNet[] = [];
-  for (const w of window) {
-    const row = summaryAt(w.year, w.month);
-    if (!row) continue;
-    const stats = memberStats(row, viewerId);
-    const g = r2(stats?.totalSent ?? 0);
-    const rc = r2(stats?.totalReceived ?? 0);
-    trend.push({
+  const trend: ReportMonthNet[] = window.map((w) => {
+    const row = monthAt(w.year, w.month);
+    const g = r2(row?.gave ?? 0);
+    const rc = r2(row?.received ?? 0);
+    return {
       year: w.year,
       month: w.month,
       label: MONTH_NAMES[w.month - 1].slice(0, 3),
       gave: g,
       received: rc,
-      net: r2(rc - g),
-    });
-  }
+      net: r2(rc - g) + 0,
+    };
+  });
+
+  const prevWindow = window[TREND_MONTHS - 2];
+  const prevRow = monthAt(prevWindow.year, prevWindow.month);
+  const previousMonth =
+    prevRow && prevRow.count > 0
+      ? {
+          gave: r2(prevRow.gave),
+          received: r2(prevRow.received),
+          net: r2(prevRow.received - prevRow.gave) + 0,
+          count: prevRow.count,
+        }
+      : null;
 
   return {
     generatedAtUtc: (opts.now ?? new Date()).toISOString(),
