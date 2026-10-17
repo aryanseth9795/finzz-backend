@@ -4,6 +4,7 @@ import { phoneVariants, canonicalPhone } from "../utils/phone.js";
 import { User } from "../models/userModel.js";
 import { FriendRequest } from "../models/friendRequestModel.js";
 import { Chat, buildPairKey } from "../models/chatModel.js";
+import { Note } from "../models/noteModel.js";
 import ErrorHandler from "../middlewares/Errorhandler.js";
 import { sendPushNotification } from "../services/notificationService.js";
 import mongoose from "mongoose";
@@ -379,9 +380,42 @@ export const removeFriend = TryCatch(
     const { friendId } = req.params;
     const userId = req.user.id;
 
-    // Remove from both users' friends arrays
-    await User.updateOne({ _id: userId }, { $pull: { friends: friendId } });
-    await User.updateOne({ _id: friendId }, { $pull: { friends: userId } });
+    /**
+     * Ending a friendship also ends note access between the pair, both ways:
+     * notes can only be shared with friends, so a share must not outlive the
+     * friendship it was granted on. Person labels are kept — a label is the
+     * owner's own filing and grants nothing.
+     *
+     * One transaction, so a failure cannot leave them unfriended but still
+     * reading each other's notes.
+     */
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await User.updateOne(
+          { _id: userId },
+          { $pull: { friends: friendId } },
+          { session },
+        );
+        await User.updateOne(
+          { _id: friendId },
+          { $pull: { friends: userId } },
+          { session },
+        );
+        await Note.updateMany(
+          { owner: userId, "shares.user": friendId },
+          { $pull: { shares: { user: friendId } } },
+          { session },
+        );
+        await Note.updateMany(
+          { owner: friendId, "shares.user": userId },
+          { $pull: { shares: { user: userId } } },
+          { session },
+        );
+      });
+    } finally {
+      await session.endSession();
+    }
 
     return res.status(200).json({
       success: true,

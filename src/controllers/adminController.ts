@@ -11,6 +11,7 @@ import { Chat } from "../models/chatModel.js";
 import { FriendRequest } from "../models/friendRequestModel.js";
 import { MonthlySummary } from "../models/monthlySummaryModel.js";
 import { Notification } from "../models/notificationModel.js";
+import { Note } from "../models/noteModel.js";
 import ErrorHandler from "../middlewares/Errorhandler.js";
 import { adminSecretKey } from "../config/envVariables.js";
 import { signAdminToken } from "../utils/tokens.js";
@@ -417,6 +418,20 @@ export const deleteUser = TryCatch(
             { session },
           ),
           PoolTx.deleteMany({ addedBy: userId }, { session }),
+
+          // Notes: their own go; their access to others' notes goes; labels
+          // pointing at them are cleared (the note itself stays with its owner).
+          Note.deleteMany({ owner: userId }, { session }),
+          Note.updateMany(
+            { "shares.user": userId },
+            { $pull: { shares: { user: userId } } },
+            { session },
+          ),
+          Note.updateMany(
+            { personLabel: userId },
+            { $set: { personLabel: null } },
+            { session },
+          ),
         ]);
 
         // Chats are 1:1, so a chat the user belonged to has no meaning without
