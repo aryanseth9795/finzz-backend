@@ -18,6 +18,7 @@ import {
 import { NOTE_POPULATE, toNoteDto, type PopulatedNote } from "../utils/noteDto.js";
 import { cursorFilter, decodeCursor, paginateBy } from "../utils/cursor.js";
 import { escapeRegex } from "../utils/escapeRegex.js";
+import { listNotesSchema } from "../middlewares/validation.js";
 import { sendBulkPushNotifications } from "../services/notificationService.js";
 
 // ========================
@@ -52,13 +53,10 @@ const noteResponse = async (noteId: unknown, userId: string) =>
 export const listNotes = TryCatch(async (req: Request, res: Response) => {
   const userId = req.user.id;
   const me = new mongoose.Types.ObjectId(userId);
-  const { scope, label, q, cursor, limit } = req.query as unknown as {
-    scope: "all" | "mine" | "shared";
-    label?: string;
-    q?: string;
-    cursor?: string;
-    limit: number;
-  };
+  // Express 5's `req.query` is a getter that re-parses the URL on every read, so
+  // validate()'s coercions/defaults never reach it. Parse it again here to get
+  // the typed values (scope default, trimmed q, numeric limit with its default).
+  const { scope, label, q, cursor, limit } = listNotesSchema.shape.query.parse(req.query);
 
   if (label && scope === "shared") {
     throw new ErrorHandler("Person filters apply to your own notes only", 400);

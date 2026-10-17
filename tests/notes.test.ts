@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from "vitest";
 import request from "supertest";
 import mongoose from "mongoose";
 import "./mailbox.js";
@@ -375,6 +375,63 @@ describe("list", () => {
     expect(new Set(seen).size).toBe(25);
     expect(seen).toHaveLength(25);
     expect(new Set(seen)).toEqual(new Set(inserted.map((n: any) => String(n._id))));
+  });
+
+  const insert25 = () => {
+    const owner = new mongoose.Types.ObjectId(alice.id);
+    return Note.insertMany(
+      Array.from({ length: 25 }, (_, i) => ({
+        owner,
+        title: `n${i}`,
+        lastEditedBy: owner,
+      })),
+    );
+  };
+
+  it("uses the default page size when no limit is sent", async () => {
+    await insert25();
+
+    const res = await request(app)
+      .get(NOTES)
+      .query({ scope: "mine" })
+      .set(as(alice))
+      .expect(200);
+
+    expect(res.body.notes).toHaveLength(20);
+    expect(res.body.hasMore).toBe(true);
+    expect(typeof res.body.nextCursor).toBe("string");
+    expect(res.body.nextCursor.length).toBeGreaterThan(0);
+  });
+
+  it("honours a numeric limit from the query string", async () => {
+    await insert25();
+    const spy = vi.spyOn(mongoose.Query.prototype, "limit");
+    try {
+      const res = await request(app)
+        .get(NOTES)
+        .query({ scope: "mine", limit: 10 })
+        .set(as(alice))
+        .expect(200);
+
+      expect(res.body.notes).toHaveLength(10);
+      expect(res.body.hasMore).toBe(true);
+      // limit + 1 must be numeric addition (11), not string concatenation ("101").
+      expect(spy).toHaveBeenCalledWith(11);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("trims the search term", async () => {
+    await createNote(app, alice, { title: "Trip (Goa)" });
+    await createNote(app, alice, { title: "unrelated" });
+
+    const res = await request(app)
+      .get(NOTES)
+      .query({ q: "  trip  " })
+      .set(as(alice))
+      .expect(200);
+    expect(res.body.notes).toHaveLength(1);
   });
 
   it("search is case-insensitive and treats regex characters literally", async () => {
