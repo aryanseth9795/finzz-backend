@@ -69,7 +69,11 @@ export interface ReportMonthNet {
   label: string;
   gave: number;
   received: number;
-  /** received − gave for that month (positive = the balance moved in the viewer's favour). */
+  /**
+   * received − gave for that month. In the report's balance convention a
+   * POSITIVE net LOWERS the balance (the friend paid the viewer back), and a
+   * NEGATIVE net RAISES it (the friend owes the viewer more).
+   */
   net: number;
 }
 
