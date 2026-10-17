@@ -18,6 +18,7 @@ import noteRoutes from "./routes/noteRoutes.js";
 
 import { CLIENT_ORIGINS } from "./config/envVariables.js";
 import { apiLimiter } from "./middlewares/rateLimit.js";
+import { recordRequest } from "./services/activityTracker.js";
 import errorMiddleware from "./middlewares/error.js";
 import ErrorHandler from "./middlewares/Errorhandler.js";
 
@@ -63,6 +64,13 @@ app.use(cookieParser());
 // deliberately does not touch the database.
 app.get("/health", (_req, res) => {
   res.status(200).json({ status: "ok", uptime: process.uptime() });
+});
+
+// Daily traffic counter (in-memory buffer, flushed to the DB on a timer).
+// `req.user` is read at response end, after isAuthenticated has had its say.
+app.use("/api", (req, res, next) => {
+  res.on("finish", () => recordRequest(!!req.user));
+  next();
 });
 
 // Global rate limit. Stricter, route-specific limits are applied on the auth
