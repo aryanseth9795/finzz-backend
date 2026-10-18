@@ -1,5 +1,6 @@
 import { NextFunction, Request, Response } from "express";
 import mongoose from "mongoose";
+import { Expo } from "expo-server-sdk";
 import crypto from "crypto";
 import TryCatch from "../utils/TryCatch.js";
 import { User } from "../models/userModel.js";
@@ -11,15 +12,39 @@ import { Chat } from "../models/chatModel.js";
 import { FriendRequest } from "../models/friendRequestModel.js";
 import { MonthlySummary } from "../models/monthlySummaryModel.js";
 import { Notification } from "../models/notificationModel.js";
+import { Note } from "../models/noteModel.js";
 import ErrorHandler from "../middlewares/Errorhandler.js";
-import { adminSecretKey } from "../config/envVariables.js";
+import {
+  adminSecretKey,
+  adminSecretKind,
+  wrongAdminCredentialMessage,
+} from "../config/envVariables.js";
 import { signAdminToken } from "../utils/tokens.js";
 import { buildSearchRegex } from "../utils/escapeRegex.js";
 import {
   broadcastPushNotification,
   sendBulkPushNotifications,
 } from "../services/notificationService.js";
+import {
+  processPushReceipts,
+  recentDeliveryStats,
+} from "../services/pushReceipts.js";
 import { PoolTx } from "../models/poolTxModel.js";
+import { PushTicket } from "../models/pushTicketModel.js";
+import {
+  DailyActivity,
+  DailyTraffic,
+} from "../models/dailyActivityModel.js";
+import {
+  dayKey,
+  flushActivity,
+  ANALYTICS_TZ_OFFSET_MINUTES,
+} from "../services/activityTracker.js";
+import { adminTrafficQuerySchema } from "../middlewares/validation.js";
+import {
+  reserveAttempt,
+  recordSuccess,
+} from "../services/adminLoginGuard.js";
 
 /**
  * Cookie options for the admin session.
@@ -40,25 +65,62 @@ const ADMIN_COOKIE_OPTIONS = {
 };
 
 // ==========================================
-// Admin Login (secret key)
+// Admin Login (6-character PIN, or legacy long secret)
 // ==========================================
+const sha256 = (value: string) =>
+  crypto.createHash("sha256").update(value, "utf8").digest();
+
+/** Upper-case ASCII letters only, so non-ASCII case folding (e.g. "ß") can't alias. */
+const asciiUpper = (value: string) =>
+  value.replace(/[a-z]/g, (c) => c.toUpperCase());
+
+/**
+ * Compare in constant time. Both sides are hashed first so the buffers are
+ * always 32 bytes: `timingSafeEqual` needs equal lengths, and hashing avoids
+ * leaking the secret's length through an early length check. A PIN is compared
+ * case-insensitively; the legacy long secret exactly.
+ */
+const adminSecretMatches = (provided: string): boolean => {
+  const isPin = /^[A-Za-z0-9]{6}$/.test(adminSecretKey);
+  const a = isPin ? asciiUpper(provided) : provided;
+  const b = isPin ? asciiUpper(adminSecretKey) : adminSecretKey;
+  return crypto.timingSafeEqual(sha256(a), sha256(b));
+};
+
+const sendLocked = (res: Response, retryAfterSeconds: number) =>
+  void res
+    .status(429)
+    .set("Retry-After", String(Math.max(1, Math.ceil(retryAfterSeconds))))
+    .json({
+      success: false,
+      message: `Too many attempts. Try again in ${Math.max(1, Math.ceil(retryAfterSeconds / 60))} min`,
+      retryAfterSeconds,
+    });
+
 export const adminLogin = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { secretKey } = req.body;
+    const ip = req.ip ?? "unknown";
 
-    // Compare in constant time. A plain `!==` returns as soon as it finds a
-    // differing byte, so response timing leaks a prefix-match oracle that turns
-    // an exponential guess into a linear one.
-    const provided = Buffer.from(String(secretKey ?? ""), "utf8");
-    const expected = Buffer.from(adminSecretKey, "utf8");
-    const matches =
-      provided.length === expected.length &&
-      crypto.timingSafeEqual(provided, expected);
+    // Reserve the attempt BEFORE comparing. The reservation is atomic, so with
+    // many guesses in flight only the permitted number is ever compared; a
+    // refused attempt (even with the correct PIN) is never looked at, so a
+    // lock cannot be probed for the answer.
+    const attempt = await reserveAttempt(ip);
+    if (!attempt.allowed) return sendLocked(res, attempt.retryAfterSeconds);
 
-    if (!matches) {
-      return next(new ErrorHandler("Invalid admin secret key", 401));
+    if (!adminSecretMatches(String(secretKey ?? ""))) {
+      // The attempt is already counted. If it was the last permitted one the
+      // lock is now in force and the caller is told so.
+      if (attempt.locked) return sendLocked(res, attempt.retryAfterSeconds);
+      return void res.status(401).json({
+        success: false,
+        message: wrongAdminCredentialMessage(adminSecretKind),
+        attemptsLeft: attempt.attemptsLeft,
+      });
     }
 
+    await recordSuccess(ip, attempt.reservedAt);
     const token = signAdminToken();
 
     res
@@ -417,6 +479,26 @@ export const deleteUser = TryCatch(
             { session },
           ),
           PoolTx.deleteMany({ addedBy: userId }, { session }),
+
+          // Notes: their own go; their access to others' notes goes; labels
+          // pointing at them are cleared (the note itself stays with its owner).
+          Note.deleteMany({ owner: userId }, { session }),
+          Note.updateMany(
+            { "shares.user": userId },
+            { $pull: { shares: { user: userId } } },
+            { session },
+          ),
+          Note.updateMany(
+            { personLabel: userId },
+            { $set: { personLabel: null } },
+            { session },
+          ),
+
+          // Per-user traffic analytics.
+          DailyActivity.deleteMany({ user: userId }, { session }),
+
+          // Push tickets hold the user's device tokens.
+          PushTicket.deleteMany({ userId }, { session }),
         ]);
 
         // Chats are 1:1, so a chat the user belonged to has no meaning without
@@ -683,8 +765,8 @@ export const sendBulkNotification = TryCatch(
     res.status(200).json({
       success: true,
       message:
-        `Delivered to ${report.accepted} device(s) across ${report.recipients} user(s); ` +
-        `${report.rejected} rejected.`,
+        `Queued ${report.accepted} notification(s) at Expo. ` +
+        `Delivery is confirmed within ~25 minutes, or press Check now.`,
       // Three distinct numbers, because they mean three different things.
       // `sentCount` previously counted messages *submitted* to Expo and was
       // reported to the operator as a delivery count.
@@ -721,35 +803,236 @@ export const sendTargetedNotification = TryCatch(
       return next(new ErrorHandler("One or more user ids are invalid", 400));
     }
 
-    const report = await sendBulkPushNotifications(
-      userIds.map((userId: string) => ({
-        userId,
-        title,
-        body,
-        data: { type: "admin_targeted" },
-      })),
-    );
-
-    if (report.accepted === 0 && report.rejected === 0) {
-      return next(
-        new ErrorHandler(
-          "None of the selected users have valid push tokens",
-          404,
+    try {
+      // Distinguish "nobody has a device" from "the send ran" so the admin sees
+      // an accurate reason instead of a generic failure.
+      const recipients = await User.find({ _id: { $in: userIds } })
+        .select("pushTokens pushToken")
+        .lean();
+      const withDevice = recipients.filter((u: any) =>
+        [...(u.pushTokens ?? []), u.pushToken].some(
+          (t) => typeof t === "string" && Expo.isExpoPushToken(t),
         ),
+      ).length;
+
+      if (withDevice === 0) {
+        return next(
+          new ErrorHandler(
+            "None of the selected users has a device registered for notifications",
+            404,
+          ),
+        );
+      }
+
+      const report = await sendBulkPushNotifications(
+        userIds.map((userId: string) => ({
+          userId,
+          title,
+          body,
+          data: { type: "admin_targeted" },
+        })),
       );
+
+      if (report.error) {
+        console.error("[admin] sendTargetedNotification send failed:", report.error);
+        return next(new ErrorHandler("Failed to send the notification", 500));
+      }
+
+      let message = `Queued ${report.accepted} notification(s) at Expo`;
+      if (report.rejected > 0) message += `; ${report.rejected} rejected`;
+      if (report.skipped > 0) {
+        message += `; ${report.skipped} user(s) skipped (no device or send failed)`;
+      }
+
+      res.status(200).json({
+        success: true,
+        message,
+        totalSelectedUsers: userIds.length,
+        accepted: report.accepted,
+        rejected: report.rejected,
+        skipped: report.skipped,
+        /** @deprecated use `accepted`. */
+        sentCount: report.accepted,
+      });
+    } catch (error) {
+      console.error("[admin] sendTargetedNotification failed:", error);
+      return next(new ErrorHandler("Failed to send the notification", 500));
+    }
+  },
+);
+
+// ==========================================
+// Push delivery health (last 24h)
+// ==========================================
+export const getNotificationHealth = TryCatch(
+  async (req: Request, res: Response) => {
+    let checkFailed: boolean | undefined;
+    if (req.query.check === "1") {
+      const run = await processPushReceipts({ olderThanMs: 0 });
+      checkFailed = run.fetchFailed > 0;
+    }
+
+    const last24h = await recentDeliveryStats();
+    const codes = Object.keys(last24h.errors);
+
+    let hint: string | null = null;
+    if (
+      codes.includes("InvalidCredentials") ||
+      codes.includes("MismatchSenderId")
+    ) {
+      hint =
+        "Expo can't deliver to Android: the FCM V1 credential for this app is missing or belongs to another Firebase project. Upload the Firebase service-account key for project finzz-1e22b with `eas credentials` (Android → Push Notifications: FCM V1).";
+    } else if (codes.length > 0 && codes.every((c) => c === "DeviceNotRegistered")) {
+      hint =
+        "Some devices uninstalled the app or changed tokens; they were removed automatically.";
+    } else if (last24h.total === 0) {
+      hint = "No pushes were sent in the last 24 hours.";
     }
 
     res.status(200).json({
       success: true,
-      message:
-        `Delivered to ${report.accepted} device(s); ${report.rejected} rejected, ` +
-        `${report.skipped} of ${userIds.length} selected user(s) had no push token.`,
-      totalSelectedUsers: userIds.length,
-      accepted: report.accepted,
-      rejected: report.rejected,
-      skipped: report.skipped,
-      /** @deprecated use `accepted`. */
-      sentCount: report.accepted,
+      last24h,
+      hint,
+      ...(checkFailed === undefined ? {} : { checkFailed }),
+    });
+  },
+);
+
+// ==========================================
+// Traffic analytics
+// ==========================================
+
+/** "+05:30" style offset string for Mongo's `$dateToString` timezone. */
+const tzOffsetString = (minutes: number): string => {
+  const sign = minutes < 0 ? "-" : "+";
+  const abs = Math.abs(minutes);
+  const hh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const mm = String(abs % 60).padStart(2, "0");
+  return `${sign}${hh}:${mm}`;
+};
+
+export const getTrafficAnalytics = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    // Express 5: validate() cannot write the coerced query back, so re-parse.
+    const { days } = adminTrafficQuerySchema.parse({ query: req.query }).query;
+
+    // Make today's buffered counts visible to the queries below.
+    await flushActivity();
+
+    const DAY_MS = 86_400_000;
+    const now = Date.now();
+    const dayAt = (ago: number) => dayKey(new Date(now - ago * DAY_MS));
+    const today = dayAt(0);
+    const dayList = Array.from({ length: days }, (_, i) => dayAt(days - 1 - i));
+    const firstDay = dayList[0];
+    const weekStart = dayAt(6);
+    const monthStart = dayAt(29);
+
+    // Start of the first local day, as a UTC instant.
+    const rangeStart = new Date(
+      Date.parse(`${firstDay}T00:00:00.000Z`) -
+        ANALYTICS_TZ_OFFSET_MINUTES * 60_000,
+    );
+
+    const [perDay, traffic, newUsersPerDay, wauAgg, mauAgg, top, firstTraffic] =
+      await Promise.all([
+        DailyActivity.aggregate([
+          { $match: { day: { $gte: firstDay, $lte: today } } },
+          {
+            $group: {
+              _id: "$day",
+              activeUsers: { $sum: 1 },
+              opens: { $sum: "$opens" },
+            },
+          },
+        ]),
+        DailyTraffic.find({ day: { $gte: firstDay, $lte: today } })
+          .select("day requests")
+          .lean(),
+        User.aggregate([
+          { $match: { createdAt: { $gte: rangeStart } } },
+          {
+            $group: {
+              _id: {
+                $dateToString: {
+                  format: "%Y-%m-%d",
+                  date: "$createdAt",
+                  timezone: tzOffsetString(ANALYTICS_TZ_OFFSET_MINUTES),
+                },
+              },
+              count: { $sum: 1 },
+            },
+          },
+        ]),
+        DailyActivity.aggregate([
+          { $match: { day: { $gte: weekStart, $lte: today } } },
+          { $group: { _id: "$user" } },
+          { $count: "n" },
+        ]),
+        DailyActivity.aggregate([
+          { $match: { day: { $gte: monthStart, $lte: today } } },
+          { $group: { _id: "$user" } },
+          { $count: "n" },
+        ]),
+        DailyActivity.find({ day: today })
+          .sort({ requests: -1, lastSeenAt: -1 })
+          .limit(10)
+          .select("user requests opens lastSeenAt")
+          .lean(),
+        DailyTraffic.findOne().sort({ day: 1 }).select("day").lean(),
+      ]);
+
+    const activityByDay = new Map<string, { activeUsers: number; opens: number }>(
+      perDay.map((d: any) => [d._id, d]),
+    );
+    const requestsByDay = new Map<string, number>(
+      traffic.map((t) => [t.day, t.requests]),
+    );
+    const newUsersByDay = new Map<string, number>(
+      newUsersPerDay.map((d: any) => [d._id, d.count]),
+    );
+
+    const daysOut = dayList.map((date) => ({
+      date,
+      activeUsers: activityByDay.get(date)?.activeUsers ?? 0,
+      opens: activityByDay.get(date)?.opens ?? 0,
+      requests: requestsByDay.get(date) ?? 0,
+      newUsers: newUsersByDay.get(date) ?? 0,
+    }));
+
+    const todayRow = daysOut[daysOut.length - 1];
+    const dau = todayRow.activeUsers;
+    const wau: number = wauAgg[0]?.n ?? 0;
+    const mau: number = mauAgg[0]?.n ?? 0;
+
+    const topUsers = await User.find({ _id: { $in: top.map((t) => t.user) } })
+      .select("name")
+      .lean();
+    const nameById = new Map(topUsers.map((u) => [String(u._id), u.name]));
+
+    res.status(200).json({
+      success: true,
+      trackingSince: firstTraffic?.day ?? null,
+      today: {
+        activeUsers: todayRow.activeUsers,
+        opens: todayRow.opens,
+        requests: todayRow.requests,
+        newUsers: todayRow.newUsers,
+      },
+      totals: {
+        dau,
+        wau,
+        mau,
+        stickiness: mau ? Math.round((dau / mau) * 1000) / 1000 : 0,
+      },
+      days: daysOut,
+      topToday: top.map((t) => ({
+        userId: String(t.user),
+        name: nameById.get(String(t.user)) ?? "Unknown",
+        requests: t.requests,
+        opens: t.opens,
+        lastSeenAt: t.lastSeenAt,
+      })),
     });
   },
 );

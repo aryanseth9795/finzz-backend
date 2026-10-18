@@ -48,13 +48,59 @@ if (JWT_SECRET.length < 32) {
   console.warn(`[config] WARNING: ${message}`);
 }
 
-if (adminSecretKey.length < 24) {
-  const message =
-    `ADMIN_SECRET_KEY is ${adminSecretKey.length} characters; at least 24 is required. ` +
-    `It is the single credential guarding every admin action.`;
-  if (isProduction) throw new Error(message);
-  console.warn(`[config] WARNING: ${message}`);
+/**
+ * ADMIN_SECRET_KEY is either:
+ *  - a 6-character PIN of letters/digits (safe only because admin login is
+ *    protected by a persistent per-IP and global lockout), or
+ *  - the legacy long secret of 24+ characters.
+ * Anything else is rejected.
+ */
+export const validateAdminSecret = (
+  value: string,
+  isProduction: boolean,
+):
+  | { ok: true; kind: "pin"; weak?: true }
+  | { ok: true; kind: "secret" }
+  | { ok: false; message: string } => {
+  if (/^[A-Za-z0-9]{6}$/.test(value)) {
+    // A digits-only PIN has just 10^6 combinations.
+    return /^[0-9]{6}$/.test(value)
+      ? { ok: true, kind: "pin", weak: true }
+      : { ok: true, kind: "pin" };
+  }
+  if (value.length >= 24) return { ok: true, kind: "secret" };
+  return {
+    ok: false,
+    message:
+      `ADMIN_SECRET_KEY is ${value.length} characters and is not a valid PIN; ` +
+      `it must be exactly 6 letters/digits (a PIN) or at least 24 characters. ` +
+      `It is the single credential guarding every admin action.` +
+      (isProduction ? "" : " (allowed in development only)"),
+  };
+};
+
+const adminSecretCheck = validateAdminSecret(adminSecretKey, isProduction);
+if (!adminSecretCheck.ok) {
+  if (isProduction) throw new Error(adminSecretCheck.message);
+  console.warn(`[config] WARNING: ${adminSecretCheck.message}`);
+} else if (adminSecretCheck.kind === "pin" && adminSecretCheck.weak) {
+  console.warn(
+    "[config] WARNING: ADMIN_SECRET_KEY is a digits-only PIN: only 10^6 " +
+      "combinations. The login lockout makes this workable, but an " +
+      "alphanumeric PIN (36^6 combinations) is much stronger.",
+  );
 }
+
+/** Which credential the admin login expects; drives the wording of errors. */
+const adminSecretKind: "pin" | "secret" = /^[A-Za-z0-9]{6}$/.test(
+  adminSecretKey,
+)
+  ? "pin"
+  : "secret";
+
+/** 401 message for a wrong admin credential, named after the active mode. */
+export const wrongAdminCredentialMessage = (kind: "pin" | "secret"): string =>
+  kind === "pin" ? "Wrong PIN" : "Wrong secret key";
 
 // ── Token lifetimes ────────────────────────────────────────────────────────
 // Access tokens are short-lived because they are replayable until they expire.
@@ -120,6 +166,32 @@ const RATE_LIMIT_MAX_REQUESTS = parseInt(
   10,
 );
 
+/**
+ * How many reverse proxies sit in front of this server (Express `trust proxy`).
+ *
+ * `req.ip` — and with it every per-IP rate limit, the admin-login per-IP lock
+ * and ADMIN_LOGIN_ALLOWLIST_IPS — is read from `X-Forwarded-For`, trusting
+ * exactly this many hops. Too high lets a client forge its address by sending
+ * its own header; too low makes every client look like the proxy. It must match
+ * the real deployment (Render: 1). Optional; defaults to 1. An invalid value
+ * warns once and falls back to 1.
+ */
+export const parseTrustProxyHops = (
+  raw: string | undefined,
+  warn: (message: string) => void = console.warn,
+): number => {
+  const value = (raw ?? "").trim();
+  if (value === "") return 1;
+  if (/^\d{1,3}$/.test(value)) return parseInt(value, 10);
+  warn(
+    `[config] WARNING: TRUST_PROXY_HOPS="${value}" is not a whole number of ` +
+      `proxy hops; falling back to 1.`,
+  );
+  return 1;
+};
+
+const TRUST_PROXY_HOPS = parseTrustProxyHops(process.env.TRUST_PROXY_HOPS);
+
 export {
   isProduction,
   JWT_SECRET,
@@ -128,6 +200,7 @@ export {
   ADMIN_TOKEN_EXPIRES_IN,
   COOKIE_EXPIRES_IN,
   adminSecretKey,
+  adminSecretKind,
   MongoURL,
   RESEND_API_KEY,
   MAIL_TRANSPORT,
@@ -136,4 +209,5 @@ export {
   API_URL,
   RATE_LIMIT_WINDOW_MS,
   RATE_LIMIT_MAX_REQUESTS,
+  TRUST_PROXY_HOPS,
 };

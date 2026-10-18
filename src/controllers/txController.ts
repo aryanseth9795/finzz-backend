@@ -9,6 +9,7 @@ import { sendPushNotification } from "../services/notificationService.js";
 import {
   updateSummaryOnAdd,
   updateSummaryOnDelete,
+  updateSummaryOnEdit,
 } from "../services/summaryService.js";
 import { decodeCursor, cursorFilter, encodeCursor } from "../utils/cursor.js";
 import { monthRangeUtc, parseTzOffset, currentPeriod } from "../utils/dates.js";
@@ -310,37 +311,122 @@ export const reviewTxn = TryCatch(
       );
     }
 
-    if (action === "verify") {
-      txn.status = "verified";
-      txn.verifiedBy = new mongoose.Types.ObjectId(userId);
-      txn.verifiedAt = new Date();
-    } else {
-      txn.status = "rejected";
-      txn.rejectedBy = new mongoose.Types.ObjectId(userId);
-      txn.rejectedAt = new Date();
-      (txn as any).rejectionRemark = rejectionRemark;
-
-      await updateSummaryOnDelete(
-        txn.chatId,
-        txn.date,
-        txn.from.toString(),
-        txn.to.toString(),
-        txn.amount,
-      );
+    /**
+     * One conditional `findOneAndUpdate`, filtered on "still pending, not mine"
+     * and, when the client sent it, the `updatedAt` the reviewer saw. A reject's
+     * summary decrement runs in the same MongoDB transaction and only if the
+     * update matched, so two racing reviews can never both decrement, and a
+     * creator edit that lands first makes the review match nothing instead of
+     * approving a version the reviewer never saw.
+     */
+    const { expectedUpdatedAt } = req.body;
+    const filter: Record<string, unknown> = {
+      _id: txn._id,
+      status: { $in: ["pending", null] },
+      addedBy: { $ne: userId },
+    };
+    if (expectedUpdatedAt !== undefined) {
+      filter.updatedAt = new Date(expectedUpdatedAt);
+    } else if (action === "verify") {
+      /**
+       * An old build sends no `expectedUpdatedAt`, so it cannot prove which
+       * version it showed the reviewer. It may still verify a row the creator
+       * never edited, but never one that has been edited (it may be approving
+       * an amount it never saw). The filter also covers an edit that lands
+       * after the read above.
+       */
+      if (txn.editedAt) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "This transaction was edited. Please refresh (or update the app) and check it again.",
+          txn: serializeTxn(txn.toObject() as TxLike),
+        });
+      }
+      filter.editedAt = null;
     }
 
-    await txn.save();
+    const now = new Date();
+    const update =
+      action === "verify"
+        ? {
+            $set: {
+              status: "verified",
+              verified: true,
+              verifiedBy: userId,
+              verifiedAt: now,
+            },
+          }
+        : {
+            $set: {
+              status: "rejected",
+              verified: false,
+              rejectedBy: userId,
+              rejectedAt: now,
+              rejectionRemark,
+            },
+            $unset: { verifiedBy: "", verifiedAt: "" },
+          };
+
+    let updated: TxLike | null = null;
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        // The callback can be retried on a transient error.
+        updated = null;
+
+        updated = await Tx.findOneAndUpdate(filter, update, {
+          new: true,
+          session,
+        }).lean<TxLike | null>();
+
+        if (!updated || action !== "reject") return;
+
+        // Use the matched document's values: they are what the summary holds.
+        await updateSummaryOnDelete(
+          txn.chatId,
+          updated.date as Date,
+          String(updated.from),
+          String(updated.to),
+          updated.amount as number,
+          session,
+        );
+      });
+    } finally {
+      await session.endSession();
+    }
+
+    if (!updated) {
+      const latest = await Tx.findById(txnId).lean<TxLike | null>();
+      if (!latest) {
+        return next(new ErrorHandler("Transaction not found", 404));
+      }
+      if (getTxnStatus(latest) !== "pending") {
+        return res.status(400).json({
+          success: false,
+          message: "This transaction was already reviewed",
+          txn: serializeTxn(latest),
+        });
+      }
+      return res.status(409).json({
+        success: false,
+        message: "This transaction was changed. Please check it again.",
+        txn: serializeTxn(latest),
+      });
+    }
+
+    const reviewed: TxLike = updated;
     await syncChatLastTransaction(txn.chatId);
 
     const reviewerName = await getUserName(userId);
     const rejectMsg = rejectionRemark
-      ? `${reviewerName} rejected your Rs. ${txn.amount} transaction — "${rejectionRemark}"`
-      : `${reviewerName} rejected your Rs. ${txn.amount} transaction`;
+      ? `${reviewerName} rejected your Rs. ${reviewed.amount} transaction — "${rejectionRemark}"`
+      : `${reviewerName} rejected your Rs. ${reviewed.amount} transaction`;
     await sendPushNotification(
       txn.addedBy.toString(),
       action === "verify" ? "Transaction Verified" : "Transaction Rejected",
       action === "verify"
-        ? `Rs. ${txn.amount} verified by ${reviewerName}`
+        ? `Rs. ${reviewed.amount} verified by ${reviewerName}`
         : rejectMsg,
       {
         type: action === "verify" ? "txn_verified" : "txn_rejected",
@@ -356,18 +442,32 @@ export const reviewTxn = TryCatch(
         action === "verify"
           ? "Transaction verified successfully"
           : "Transaction rejected successfully",
-      txn: serializeTxn(txn.toObject()),
+      txn: serializeTxn(reviewed),
     });
   },
 );
 
 
-// Edit transaction — only allowed when status === "rejected"
+/**
+ * Edit a transaction. Only the creator may, and only until the other person
+ * has verified it: a PENDING edit stays pending and applies a summary delta; a
+ * REJECTED edit goes back to pending and re-adds the summary (the reject had
+ * removed it).
+ *
+ * The write is a single conditional `findOneAndUpdate` filtered on creator,
+ * the status we read and, when the client sent it, `expectedUpdatedAt`. The
+ * summary update runs in the same MongoDB transaction, so either both land or
+ * neither does, and a verify that wins the race makes the edit match nothing
+ * instead of silently overwriting what the verifier saw.
+ *
+ * `findOneAndUpdate` bypasses the schema's pre-save hook, so the hook's
+ * clean-up of verified/rejected metadata is done explicitly with `$unset`.
+ */
 export const editTxn = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { txnId } = req.params;
     const userId = req.user.id;
-    const { amount, date, remarks, to, from } = req.body;
+    const { amount, date, remarks, to, from, expectedUpdatedAt } = req.body;
 
     const txn = await Tx.findById(txnId);
 
@@ -382,102 +482,211 @@ export const editTxn = TryCatch(
       );
     }
 
-    // Guard: cannot edit verified transactions
-    if (txn.status === "verified") {
+    // Guard: cannot edit verified transactions. Pending and rejected are fine.
+    const oldStatus = getTxnStatus(txn);
+    if (oldStatus === "verified") {
       return next(new ErrorHandler("Cannot edit a verified transaction", 403));
     }
 
-    // Guard: can only edit rejected transactions (not pending)
-    if (txn.status !== "rejected") {
-      return next(
-        new ErrorHandler(
-          "You can only edit a transaction after it has been rejected",
-          403,
-        ),
+    const old = {
+      amount: txn.amount as number,
+      date: new Date(txn.date),
+      remarks: txn.remarks,
+      from: txn.from.toString(),
+      to: txn.to.toString(),
+    };
+
+    const target = {
+      amount: amount !== undefined ? (amount as number) : old.amount,
+      date: date !== undefined ? new Date(date) : old.date,
+      remarks: remarks !== undefined ? (remarks as string) : old.remarks,
+      from: from !== undefined ? String(from) : old.from,
+      to: to !== undefined ? String(to) : old.to,
+    };
+
+    // Guard: cannot move the date to a closed month (same rule as add).
+    // `tzOffsetMinutes` is stripped by the zod schema, so this is effectively
+    // UTC, exactly as `addtxns` behaves today.
+    // Only a CHANGED date is checked: a pending row dated in an earlier month
+    // may still have its amount, remarks or direction fixed (it was never
+    // verified, so its month total moving by the delta is correct).
+    if (date !== undefined && target.date.getTime() !== old.date.getTime()) {
+      ensureCurrentMonth(
+        target.date,
+        "Cannot move transactions to closed months.",
+        parseTzOffset(req.body.tzOffsetMinutes),
       );
     }
 
-    // Guard: cannot move date to a closed month
-    if (date !== undefined) {
-      const newDate = new Date(date);
-      const now = new Date();
-      const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-      if (newDate < currentMonthStart) {
-        return next(
-          new ErrorHandler(
-            "Cannot move transactions to closed months.",
-            400,
-          ),
-        );
-      }
-    }
-
     /**
-     * Re-validate the participants whenever they change.
-     *
-     * `addtxns` calls `validateTxnParticipants()`; this handler assigned `to`
-     * and `from` straight onto the document, and the route had no schema at
-     * all — so arbitrary user ids could be written into a transaction and
-     * propagated into MonthlySummary, attributing money to people who were
-     * never part of the chat.
+     * Re-validate the participants whenever they change, same contract as
+     * `addtxns`; otherwise arbitrary user ids could be written into a
+     * transaction and propagated into MonthlySummary.
      */
-    const nextTo = to !== undefined ? String(to) : txn.to.toString();
-    const nextFrom = from !== undefined ? String(from) : txn.from.toString();
-
     if (to !== undefined || from !== undefined) {
       const memberIds = await getChatMemberIds(txn.chatId.toString());
-      // Throws ErrorHandler, caught by TryCatch — same contract as addtxns.
-      validateTxnParticipants(memberIds, nextFrom, nextTo);
+      validateTxnParticipants(memberIds, target.from, target.to);
     }
 
-    // Update fields
-    if (amount !== undefined) txn.amount = amount;
-    if (date !== undefined) txn.date = new Date(date);
-    if (remarks !== undefined) txn.remarks = remarks;
-    txn.to = nextTo as unknown as typeof txn.to;
-    txn.from = nextFrom as unknown as typeof txn.from;
+    const now = new Date();
+    const filter: Record<string, unknown> = {
+      _id: txn._id,
+      addedBy: userId,
+      // A pending row written before `status` existed has no field at all.
+      status: oldStatus === "pending" ? { $in: ["pending", null] } : oldStatus,
+    };
+    if (expectedUpdatedAt !== undefined) {
+      filter.updatedAt = new Date(expectedUpdatedAt);
+    }
 
-    // Reset status to pending for re-review; clear reject metadata
-    txn.status = "pending";
-    txn.verified = false;
-    txn.rejectedBy = undefined;
-    txn.rejectedAt = undefined;
+    // Only the fields the client sent are written, so a concurrent edit of a
+    // different field is not overwritten with this request's stale read.
+    const $set: Record<string, unknown> = {
+      editedAt: now,
+      status: "pending",
+      verified: false,
+    };
+    if (amount !== undefined) $set.amount = target.amount;
+    if (date !== undefined) $set.date = target.date;
+    if (from !== undefined) $set.from = target.from;
+    if (to !== undefined) $set.to = target.to;
+    if (remarks !== undefined) $set.remarks = target.remarks;
 
-    await txn.save();
+    let updated: TxLike | null = null;
+    let applied = old;
+    let appliedTarget = target;
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        // The callback can be retried on a transient error.
+        updated = null;
 
-    // Re-apply balance since reject previously rolled it back
-    await updateSummaryOnAdd(
-      txn.chatId,
-      new Date(txn.date),
-      txn.from.toString(),
-      txn.to.toString(),
-      txn.amount,
-    );
+        // `new: false` returns the PRE-image of the row this update matched.
+        // The summary delta is computed from it, never from the earlier
+        // unlocked read, so concurrent edits cannot corrupt the month total.
+        const pre = await Tx.findOneAndUpdate(
+          filter,
+          {
+            $set,
+            $inc: { editCount: 1 },
+            $unset: {
+              rejectedBy: "",
+              rejectedAt: "",
+              rejectionRemark: "",
+              verifiedBy: "",
+              verifiedAt: "",
+            },
+          },
+          { new: false, session },
+        ).lean<TxLike | null>();
+
+        if (!pre) return;
+
+        applied = {
+          amount: pre.amount as number,
+          date: new Date(pre.date as Date),
+          remarks: pre.remarks,
+          from: String(pre.from),
+          to: String(pre.to),
+        };
+        appliedTarget = {
+          amount: amount !== undefined ? (amount as number) : applied.amount,
+          date: date !== undefined ? new Date(date) : applied.date,
+          remarks: remarks !== undefined ? (remarks as string) : applied.remarks,
+          from: from !== undefined ? String(from) : applied.from,
+          to: to !== undefined ? String(to) : applied.to,
+        };
+
+        if (oldStatus === "pending") {
+          await updateSummaryOnEdit(txn.chatId, applied, appliedTarget, session);
+        } else {
+          // Rejected: the reject already removed it from the summary.
+          await updateSummaryOnAdd(
+            txn.chatId,
+            appliedTarget.date,
+            appliedTarget.from,
+            appliedTarget.to,
+            appliedTarget.amount,
+            session,
+          );
+        }
+
+        updated = await Tx.findById(pre._id)
+          .session(session)
+          .lean<TxLike | null>();
+      });
+    } finally {
+      await session.endSession();
+    }
+
+    if (!updated) {
+      // The filter matched nothing: find out why.
+      const latest = await Tx.findById(txnId).lean<TxLike | null>();
+      if (!latest) {
+        return next(new ErrorHandler("Transaction not found", 404));
+      }
+      if (latest.addedBy?.toString() !== userId) {
+        return next(
+          new ErrorHandler("You can only edit your own transactions", 403),
+        );
+      }
+      if (getTxnStatus(latest) === "verified") {
+        return res.status(409).json({
+          success: false,
+          message: "This transaction was just verified, so it can't be edited.",
+          txn: serializeTxn(latest),
+        });
+      }
+      return res.status(409).json({
+        success: false,
+        message: "This transaction was changed. Please review it and try again.",
+        txn: serializeTxn(latest),
+      });
+    }
 
     await syncChatLastTransaction(txn.chatId);
 
-    // Notify the other member that the transaction was reworked
+    // Notify the other member
     const memberIds = await getChatMemberIds(txn.chatId);
     const otherMemberId = getOtherMemberId(memberIds, userId);
     if (otherMemberId) {
       const senderName = await getUserName(userId);
-      await sendPushNotification(
-        otherMemberId,
-        "Transaction Resubmitted",
-        `${senderName} resubmitted Rs. ${txn.amount} for review`,
-        {
-          type: "txn_reworked",
-          senderId: userId,
-          chatId: txn.chatId.toString(),
-          txnId: txn._id.toString(),
-        },
-      );
+      if (oldStatus === "pending") {
+        await sendPushNotification(
+          otherMemberId,
+          "Transaction Edited",
+          appliedTarget.amount !== applied.amount
+            ? `${senderName} edited a pending transaction: Rs. ${applied.amount} → Rs. ${appliedTarget.amount}`
+            : `${senderName} edited a pending transaction`,
+          {
+            type: "txn_edited",
+            senderId: userId,
+            chatId: txn.chatId.toString(),
+            txnId: txn._id.toString(),
+          },
+        );
+      } else {
+        await sendPushNotification(
+          otherMemberId,
+          "Transaction Resubmitted",
+          `${senderName} resubmitted Rs. ${appliedTarget.amount} for review`,
+          {
+            type: "txn_reworked",
+            senderId: userId,
+            chatId: txn.chatId.toString(),
+            txnId: txn._id.toString(),
+          },
+        );
+      }
     }
 
     return res.status(200).json({
       success: true,
-      message: "Transaction resubmitted for review",
-      txn: serializeTxn(txn.toObject()),
+      message:
+        oldStatus === "pending"
+          ? "Transaction updated"
+          : "Transaction resubmitted for review",
+      txn: serializeTxn(updated as TxLike),
     });
   },
 );
@@ -519,8 +728,32 @@ export const deleteTxn = TryCatch(
     const chatId = txn.chatId;
 
     // Do NOT call updateSummaryOnDelete — the reject flow already rolled back the balance.
-    // Simply remove the document.
-    await Tx.findByIdAndDelete(txnId);
+    // Remove the document atomically, only while it is still rejected and ours:
+    // a resubmit that lands after the read above has re-added it to the
+    // summary, and deleting it then would leave the totals counting a row that
+    // no longer exists.
+    const deleted = await Tx.findOneAndDelete({
+      _id: txn._id,
+      addedBy: userId,
+      status: "rejected",
+    }).lean<TxLike | null>();
+
+    if (!deleted) {
+      const latest = await Tx.findById(txnId).lean<TxLike | null>();
+      if (!latest) {
+        return next(new ErrorHandler("Transaction not found", 404));
+      }
+      if (latest.addedBy?.toString() !== userId) {
+        return next(
+          new ErrorHandler("You can only delete your own transactions", 403),
+        );
+      }
+      return res.status(409).json({
+        success: false,
+        message: "This transaction was changed, so it can't be deleted.",
+        txn: serializeTxn(latest),
+      });
+    }
 
     await syncChatLastTransaction(chatId);
 

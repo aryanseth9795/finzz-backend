@@ -1,6 +1,12 @@
 import { z } from "zod";
 import { Request, Response, NextFunction } from "express";
 import { compareVersions } from "../utils/semver.js";
+import { MAX_SEARCH_LENGTH } from "../utils/escapeRegex.js";
+import {
+  NOTE_BODY_MAX,
+  NOTE_SHARES_MAX,
+  NOTE_TITLE_MAX,
+} from "../models/noteModel.js";
 
 //======= Shared primitives =======//
 //
@@ -97,6 +103,7 @@ export const editTxnSchema = z.object({
     remarks: shortText(200, "Remarks").optional(),
     to: objectId.optional(),
     from: objectId.optional(),
+    expectedUpdatedAt: isoDate.optional(),
   }),
 });
 
@@ -110,7 +117,7 @@ export const getTxnsSchema = z.object({
 });
 
 export const verifyTxnSchema = z.object({
-  body: z.object({ txnId: objectId }),
+  body: z.object({ txnId: objectId, expectedUpdatedAt: isoDate.optional() }),
 });
 
 export const reviewTxnSchema = z.object({
@@ -118,6 +125,7 @@ export const reviewTxnSchema = z.object({
     txnId: z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid txnId"),
     action: z.enum(["verify", "reject"]).default("verify"),
     remark: z.string().max(200, "Remark too long").optional(),
+    expectedUpdatedAt: isoDate.optional(),
   }),
 });
 
@@ -142,6 +150,21 @@ export const updatePushTokenSchema = z.object({
     pushToken: z
       .string()
       .startsWith("ExponentPushToken[", "Invalid Expo push token format"),
+  }),
+});
+
+export const updatePushStatusSchema = z.object({
+  body: z.object({
+    outcome: z.enum([
+      "registered",
+      "unchanged",
+      "permission-denied",
+      "not-a-device",
+      "no-project-id",
+      "token-error",
+      "upload-error",
+    ]),
+    detail: z.string().max(200, "Detail too long").optional(),
   }),
 });
 
@@ -490,6 +513,12 @@ export const adminPoolQuerySchema = z.object({
   }),
 });
 
+export const adminTrafficQuerySchema = z.object({
+  query: z.object({
+    days: z.coerce.number().int().min(1).max(90).default(30),
+  }),
+});
+
 export const bulkNotificationSchema = z.object({
   body: z.object({
     title: z.string().trim().min(1, "Title is required").max(100),
@@ -549,4 +578,79 @@ export const appReleaseSchema = z.object({
         path: ["minSupportedVersion"],
       },
     ),
+});
+
+//======= Notes =======//
+
+const noteTitle = shortText(NOTE_TITLE_MAX, "Title");
+const noteBody = z
+  .string()
+  .max(NOTE_BODY_MAX, `Note must be ${NOTE_BODY_MAX} characters or fewer`);
+
+export const createNoteSchema = z.object({
+  body: z.object({
+    title: noteTitle.optional(),
+    body: noteBody.optional(),
+    personLabel: objectId.nullable().optional(),
+  }),
+});
+
+export const listNotesSchema = z.object({
+  query: z.object({
+    scope: z.enum(["all", "mine", "shared"]).default("all"),
+    label: z.union([objectId, z.literal("none")]).optional(),
+    q: z
+      .string()
+      .trim()
+      .max(MAX_SEARCH_LENGTH, `Search must be ${MAX_SEARCH_LENGTH} characters or fewer`)
+      .optional(),
+    cursor: z.string().max(120).optional(),
+    limit: z.coerce.number().int().min(1).max(50).default(20),
+  }),
+});
+
+export const noteIdParamSchema = z.object({
+  params: z.object({ noteId: objectId }),
+});
+
+export const updateNoteSchema = z.object({
+  params: z.object({ noteId: objectId }),
+  body: z
+    .object({
+      title: noteTitle.optional(),
+      body: noteBody.optional(),
+      version: z.number().int().min(1),
+    })
+    .refine((b) => b.title !== undefined || b.body !== undefined, {
+      message: "Nothing to update",
+      path: ["body"],
+    }),
+});
+
+export const noteLabelSchema = z.object({
+  params: z.object({ noteId: objectId }),
+  body: z.object({ personLabel: objectId.nullable() }),
+});
+
+export const shareNoteSchema = z.object({
+  params: z.object({ noteId: objectId }),
+  body: z.object({
+    shares: z
+      .array(
+        z.object({
+          userId: objectId,
+          permission: z.enum(["view", "edit"]).default("view"),
+        }),
+      )
+      .min(1, "Choose at least one person")
+      .max(NOTE_SHARES_MAX, `A note can be shared with at most ${NOTE_SHARES_MAX} people`)
+      .refine(
+        (shares) => new Set(shares.map((s) => s.userId)).size === shares.length,
+        "Each person can be listed once",
+      ),
+  }),
+});
+
+export const noteShareUserParamSchema = z.object({
+  params: z.object({ noteId: objectId, userId: objectId }),
 });

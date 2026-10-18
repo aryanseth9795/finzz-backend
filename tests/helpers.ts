@@ -133,3 +133,25 @@ export const adminCookie = async (app: Express): Promise<string> => {
   const cookies = res.headers["set-cookie"] as unknown as string[];
   return cookies.map((c) => c.split(";")[0]).join("; ");
 };
+
+/** Create a note as `user` through the real API and return the note DTO. */
+export const createNote = async (
+  app: Express,
+  user: TestUser,
+  body: { title?: string; body?: string; personLabel?: string | null } = {},
+) => {
+  const res = await request(app)
+    .post("/api/v1/notes")
+    .set(auth(user.accessToken))
+    .send({ title: "Note", body: "", ...body })
+    .expect(201);
+  return res.body.note;
+};
+
+/** End the friendship between `a` and `b`. */
+export const unfriend = async (app: Express, a: TestUser, b: TestUser) => {
+  await request(app)
+    .delete(`/api/v1/friends/remove/${b.id}`)
+    .set(auth(a.accessToken))
+    .expect(200);
+};

@@ -78,6 +78,10 @@ Until this is done, `withTransaction` will fail at runtime in local dev with
 | `authorization.test.ts` | The chat-stats IDOR, transaction ownership, participant re-validation on edit, admin role separation |
 | `otp.test.ts` | Code format and entropy, attempt counter, no sentinel users, verification required for registration, reset flow, TTL index |
 | `security.test.ts` | HTML/regex/cursor/date unit tests, XSS end-to-end through the real export, helmet headers, body limits |
+| `noteAccess.test.ts` | Notes permission matrix, role resolution, role-shaped DTO (label/share list stripped for recipients), cursor on `editedAt` |
+| `notes.test.ts` | Notes CRUD, validation and mass-assignment, labels never share, optimistic concurrency (409), list scopes/label filter, tie-safe paging, literal search |
+| `notesSharing.test.ts` | Owner-only grant/change/revoke, view vs edit, leave, edit-after-downgrade/revoke race, share cap, content-free push |
+| `notesCascade.test.ts` | Unfriend revokes note shares both ways (labels kept); account deletion cascades notes, shares and labels |
 
 ## Notes on approach
 

@@ -1,6 +1,7 @@
 import { Expo, ExpoPushMessage, ExpoPushTicket } from "expo-server-sdk";
 import { User } from "../models/userModel.js";
 import { Notification } from "../models/notificationModel.js";
+import { PushTicket } from "../models/pushTicketModel.js";
 
 // Create a new Expo SDK client
 const expo = new Expo();
@@ -12,6 +13,8 @@ export interface DeliveryReport {
   rejected: number;
   /** Recipients that had no usable push token at all. */
   skipped: number;
+  /** Set when the send path itself failed (not merely a rejected message). */
+  error?: string;
 }
 
 /**
@@ -67,6 +70,75 @@ const pruneDeadTokens = async (
   ]);
 };
 
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+/**
+ * Ticket bookkeeping (saving ticket ids, pruning dead tokens) runs off the
+ * request path. In-flight work is tracked here so tests can wait for it.
+ */
+const pendingWork = new Set<Promise<void>>();
+
+const runInBackground = (label: string, work: () => Promise<void>): void => {
+  const task: Promise<void> = Promise.resolve()
+    .then(work)
+    .catch((error) => {
+      console.error(`[push] ${label} failed:`, errorMessage(error));
+    })
+    .finally(() => {
+      pendingWork.delete(task);
+    });
+  pendingWork.add(task);
+};
+
+/** Wait for all in-flight background bookkeeping. Intended for tests. */
+export async function flushPendingPushWork(): Promise<void> {
+  while (pendingWork.size > 0) {
+    await Promise.allSettled([...pendingWork]);
+  }
+}
+
+/**
+ * Remember the ids of accepted tickets so their delivery receipts can be
+ * fetched later (see pushReceipts.ts). Best effort: a database problem here
+ * must never stop notifications from being sent.
+ */
+const persistTickets = async (
+  messages: ExpoPushMessage[],
+  tickets: ExpoPushTicket[],
+): Promise<void> => {
+  try {
+    const rows: Array<{ ticketId: string; token: string }> = [];
+    tickets.forEach((ticket, index) => {
+      const to = messages[index]?.to;
+      if (ticket.status === "ok" && ticket.id && typeof to === "string") {
+        rows.push({ ticketId: ticket.id, token: to });
+      }
+    });
+    if (rows.length === 0) return;
+
+    const tokens = [...new Set(rows.map((r) => r.token))];
+    const owners = await User.find({
+      $or: [{ pushTokens: { $in: tokens } }, { pushToken: { $in: tokens } }],
+    })
+      .select("_id pushTokens pushToken")
+      .lean<Array<{ _id: unknown; pushTokens?: string[]; pushToken?: string }>>();
+    const ownerOf = new Map<string, unknown>();
+    for (const u of owners) {
+      for (const t of [...(u.pushTokens ?? []), u.pushToken]) {
+        if (t) ownerOf.set(t, u._id);
+      }
+    }
+
+    await PushTicket.insertMany(
+      rows.map((r) => ({ ...r, userId: ownerOf.get(r.token) })),
+      { ordered: false },
+    );
+  } catch (error) {
+    console.error("[push] could not persist tickets:", errorMessage(error));
+  }
+};
+
 /**
  * Send a chunked batch and report what actually happened.
  *
@@ -92,11 +164,12 @@ const dispatch = async (
         if (ticket.status === "ok") accepted += 1;
         else rejected += 1;
       }
-      await pruneDeadTokens(slice, tickets);
+      runInBackground("persist tickets", () => persistTickets(slice, tickets));
+      runInBackground("prune dead tokens", () => pruneDeadTokens(slice, tickets));
     } catch (error) {
       // A transport failure fails the whole chunk; count it honestly.
       rejected += chunk.length;
-      console.error("[push] chunk delivery failed:", error);
+      console.error("[push] chunk delivery failed:", errorMessage(error));
     }
   }
 
@@ -114,14 +187,19 @@ export async function sendPushNotification(
   data?: Record<string, unknown>,
 ): Promise<DeliveryReport> {
   try {
-    await Notification.create({
-      recipient: userId,
-      sender: data?.senderId,
-      type: data?.type,
-      title,
-      body,
-      data,
-    });
+    // The in-app feed row must never stop the push itself.
+    try {
+      await Notification.create({
+        recipient: userId,
+        sender: data?.senderId,
+        type: data?.type,
+        title,
+        body,
+        data,
+      });
+    } catch (error) {
+      console.error("[push] could not save feed notification:", errorMessage(error));
+    }
 
     const user = await User.findById(userId)
       .select("pushTokens pushToken")
@@ -145,7 +223,7 @@ export async function sendPushNotification(
   } catch (error) {
     // Notification delivery must never fail the request that triggered it —
     // a transaction still succeeded even if the phone was not told about it.
-    console.error("[push] sendPushNotification failed:", error);
+    console.error("[push] sendPushNotification failed:", errorMessage(error));
     return { accepted: 0, rejected: 0, skipped: 1 };
   }
 }
@@ -175,16 +253,21 @@ export async function sendBulkPushNotifications(
       users.map((u: any) => [String(u._id), collectTokens(u)]),
     );
 
-    await Notification.insertMany(
-      notifications.map((n) => ({
-        recipient: n.userId,
-        sender: n.data?.senderId,
-        type: n.data?.type,
-        title: n.title,
-        body: n.body,
-        data: n.data,
-      })),
-    );
+    // The in-app feed rows must never stop the push itself.
+    try {
+      await Notification.insertMany(
+        notifications.map((n) => ({
+          recipient: n.userId,
+          sender: n.data?.senderId,
+          type: n.data?.type,
+          title: n.title,
+          body: n.body,
+          data: n.data,
+        })),
+      );
+    } catch (error) {
+      console.error("[push] could not save feed notifications:", errorMessage(error));
+    }
 
     const messages: ExpoPushMessage[] = [];
     let skipped = 0;
@@ -209,8 +292,13 @@ export async function sendBulkPushNotifications(
     const { accepted, rejected } = await dispatch(messages);
     return { accepted, rejected, skipped };
   } catch (error) {
-    console.error("[push] sendBulkPushNotifications failed:", error);
-    return { accepted: 0, rejected: 0, skipped: notifications.length };
+    console.error("[push] sendBulkPushNotifications failed:", errorMessage(error));
+    return {
+      accepted: 0,
+      rejected: 0,
+      skipped: notifications.length,
+      error: errorMessage(error),
+    };
   }
 }
 

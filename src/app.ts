@@ -14,9 +14,11 @@ import expenseRoutes from "./routes/expenseRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
 import notificationRoutes from "./routes/notificationRoutes.js";
 import appRoutes from "./routes/appRoutes.js";
+import noteRoutes from "./routes/noteRoutes.js";
 
-import { CLIENT_ORIGINS } from "./config/envVariables.js";
+import { CLIENT_ORIGINS, TRUST_PROXY_HOPS } from "./config/envVariables.js";
 import { apiLimiter } from "./middlewares/rateLimit.js";
+import { recordRequest } from "./services/activityTracker.js";
 import errorMiddleware from "./middlewares/error.js";
 import ErrorHandler from "./middlewares/Errorhandler.js";
 
@@ -36,7 +38,8 @@ const app = express();
 // Render/Heroku-style platforms terminate TLS at a proxy. Without this,
 // `req.ip` is the proxy's address, which would make every rate limiter treat
 // all traffic as one client, and `secure` cookies would be misjudged.
-app.set("trust proxy", 1);
+// The hop count must match the real number of proxies (TRUST_PROXY_HOPS).
+app.set("trust proxy", TRUST_PROXY_HOPS);
 
 // Baseline security headers: HSTS, nosniff, frameguard, referrer policy.
 // `contentSecurityPolicy` is disabled because this process serves only JSON —
@@ -64,6 +67,19 @@ app.get("/health", (_req, res) => {
   res.status(200).json({ status: "ok", uptime: process.uptime() });
 });
 
+// Daily traffic counter (in-memory buffer, flushed to the DB on a timer).
+// `req.user` is read at response end, after isAuthenticated has had its say.
+// The admin panel's own calls are skipped so they don't inflate "requests",
+// and so are rate-limited (429) responses, so a runaway client doesn't either.
+app.use("/api", (req, res, next) => {
+  if (!req.originalUrl.startsWith("/api/v1/admin")) {
+    res.on("finish", () => {
+      if (res.statusCode !== 429) recordRequest(!!req.user);
+    });
+  }
+  next();
+});
+
 // Global rate limit. Stricter, route-specific limits are applied on the auth
 // and OTP endpoints inside their own routers.
 app.use("/api", apiLimiter);
@@ -79,6 +95,7 @@ app.use("/api/v1/expenses", expenseRoutes);
 app.use("/api/v1/admin", adminRoutes);
 app.use("/api/v1/notifications", notificationRoutes);
 app.use("/api/v1/app", appRoutes);
+app.use("/api/v1/notes", noteRoutes);
 
 // Unknown route → JSON 404. Previously an unmatched path fell through to
 // Express's HTML error page, which clients parsing JSON could not read.

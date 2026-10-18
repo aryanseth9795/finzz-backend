@@ -13,6 +13,22 @@ export interface IRefreshTokenGrant {
   expiresAt: Date;
 }
 
+export const PUSH_STATUS_OUTCOMES = [
+  "registered",
+  "unchanged",
+  "permission-denied",
+  "not-a-device",
+  "no-project-id",
+  "token-error",
+  "upload-error",
+] as const;
+
+export interface IPushStatus {
+  outcome: (typeof PUSH_STATUS_OUTCOMES)[number];
+  detail?: string;
+  at: Date;
+}
+
 // TypeScript interface for User document
 export interface IUser extends Document {
   name: string;
@@ -29,6 +45,8 @@ export interface IUser extends Document {
   pushTokens: string[];
   /** @deprecated Legacy single push token. Read-only; kept for migration. */
   pushToken?: string;
+  /** Last device-side push registration outcome reported by the app. */
+  pushStatus?: IPushStatus;
   refreshTokens: IRefreshTokenGrant[];
   /** @deprecated Legacy single refresh token. Accepted during grace period. */
   refreshToken?: string;
@@ -120,6 +138,16 @@ const userSchema = new Schema<IUser>(
     /** @deprecated superseded by pushTokens */
     pushToken: {
       type: String,
+    },
+    pushStatus: {
+      type: new Schema(
+        {
+          outcome: { type: String, enum: PUSH_STATUS_OUTCOMES, required: true },
+          detail: { type: String, maxlength: 200 },
+          at: { type: Date, required: true },
+        },
+        { _id: false },
+      ),
     },
     refreshTokens: {
       type: [refreshTokenGrantSchema],
