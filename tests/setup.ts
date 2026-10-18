@@ -23,7 +23,7 @@ process.env.NODE_ENV = "test";
 process.env.MONGO_URL = TEST_MONGO_URL;
 process.env.JWT_SECRET =
   "test-jwt-secret-that-is-definitely-at-least-32-chars-long";
-process.env.ADMIN_SECRET_KEY = "test-admin-secret-key-24-plus-chars";
+process.env.ADMIN_SECRET_KEY = "A1B2C3";
 process.env.RESEND_API = "";
 process.env.PORT = "0";
 process.env.API_URL = "";

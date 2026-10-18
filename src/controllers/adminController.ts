@@ -13,7 +13,11 @@ import { MonthlySummary } from "../models/monthlySummaryModel.js";
 import { Notification } from "../models/notificationModel.js";
 import { Note } from "../models/noteModel.js";
 import ErrorHandler from "../middlewares/Errorhandler.js";
-import { adminSecretKey } from "../config/envVariables.js";
+import {
+  adminSecretKey,
+  adminSecretKind,
+  wrongAdminCredentialMessage,
+} from "../config/envVariables.js";
 import { signAdminToken } from "../utils/tokens.js";
 import { buildSearchRegex } from "../utils/escapeRegex.js";
 import {
@@ -31,6 +35,10 @@ import {
   ANALYTICS_TZ_OFFSET_MINUTES,
 } from "../services/activityTracker.js";
 import { adminTrafficQuerySchema } from "../middlewares/validation.js";
+import {
+  reserveAttempt,
+  recordSuccess,
+} from "../services/adminLoginGuard.js";
 
 /**
  * Cookie options for the admin session.
@@ -51,25 +59,62 @@ const ADMIN_COOKIE_OPTIONS = {
 };
 
 // ==========================================
-// Admin Login (secret key)
+// Admin Login (6-character PIN, or legacy long secret)
 // ==========================================
+const sha256 = (value: string) =>
+  crypto.createHash("sha256").update(value, "utf8").digest();
+
+/** Upper-case ASCII letters only, so non-ASCII case folding (e.g. "ß") can't alias. */
+const asciiUpper = (value: string) =>
+  value.replace(/[a-z]/g, (c) => c.toUpperCase());
+
+/**
+ * Compare in constant time. Both sides are hashed first so the buffers are
+ * always 32 bytes: `timingSafeEqual` needs equal lengths, and hashing avoids
+ * leaking the secret's length through an early length check. A PIN is compared
+ * case-insensitively; the legacy long secret exactly.
+ */
+const adminSecretMatches = (provided: string): boolean => {
+  const isPin = /^[A-Za-z0-9]{6}$/.test(adminSecretKey);
+  const a = isPin ? asciiUpper(provided) : provided;
+  const b = isPin ? asciiUpper(adminSecretKey) : adminSecretKey;
+  return crypto.timingSafeEqual(sha256(a), sha256(b));
+};
+
+const sendLocked = (res: Response, retryAfterSeconds: number) =>
+  void res
+    .status(429)
+    .set("Retry-After", String(Math.max(1, Math.ceil(retryAfterSeconds))))
+    .json({
+      success: false,
+      message: `Too many attempts. Try again in ${Math.max(1, Math.ceil(retryAfterSeconds / 60))} min`,
+      retryAfterSeconds,
+    });
+
 export const adminLogin = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { secretKey } = req.body;
+    const ip = req.ip ?? "unknown";
 
-    // Compare in constant time. A plain `!==` returns as soon as it finds a
-    // differing byte, so response timing leaks a prefix-match oracle that turns
-    // an exponential guess into a linear one.
-    const provided = Buffer.from(String(secretKey ?? ""), "utf8");
-    const expected = Buffer.from(adminSecretKey, "utf8");
-    const matches =
-      provided.length === expected.length &&
-      crypto.timingSafeEqual(provided, expected);
+    // Reserve the attempt BEFORE comparing. The reservation is atomic, so with
+    // many guesses in flight only the permitted number is ever compared; a
+    // refused attempt (even with the correct PIN) is never looked at, so a
+    // lock cannot be probed for the answer.
+    const attempt = await reserveAttempt(ip);
+    if (!attempt.allowed) return sendLocked(res, attempt.retryAfterSeconds);
 
-    if (!matches) {
-      return next(new ErrorHandler("Invalid admin secret key", 401));
+    if (!adminSecretMatches(String(secretKey ?? ""))) {
+      // The attempt is already counted. If it was the last permitted one the
+      // lock is now in force and the caller is told so.
+      if (attempt.locked) return sendLocked(res, attempt.retryAfterSeconds);
+      return void res.status(401).json({
+        success: false,
+        message: wrongAdminCredentialMessage(adminSecretKind),
+        attemptsLeft: attempt.attemptsLeft,
+      });
     }
 
+    await recordSuccess(ip, attempt.reservedAt);
     const token = signAdminToken();
 
     res
