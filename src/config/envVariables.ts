@@ -166,6 +166,32 @@ const RATE_LIMIT_MAX_REQUESTS = parseInt(
   10,
 );
 
+/**
+ * How many reverse proxies sit in front of this server (Express `trust proxy`).
+ *
+ * `req.ip` — and with it every per-IP rate limit, the admin-login per-IP lock
+ * and ADMIN_LOGIN_ALLOWLIST_IPS — is read from `X-Forwarded-For`, trusting
+ * exactly this many hops. Too high lets a client forge its address by sending
+ * its own header; too low makes every client look like the proxy. It must match
+ * the real deployment (Render: 1). Optional; defaults to 1. An invalid value
+ * warns once and falls back to 1.
+ */
+export const parseTrustProxyHops = (
+  raw: string | undefined,
+  warn: (message: string) => void = console.warn,
+): number => {
+  const value = (raw ?? "").trim();
+  if (value === "") return 1;
+  if (/^\d{1,3}$/.test(value)) return parseInt(value, 10);
+  warn(
+    `[config] WARNING: TRUST_PROXY_HOPS="${value}" is not a whole number of ` +
+      `proxy hops; falling back to 1.`,
+  );
+  return 1;
+};
+
+const TRUST_PROXY_HOPS = parseTrustProxyHops(process.env.TRUST_PROXY_HOPS);
+
 export {
   isProduction,
   JWT_SECRET,
@@ -183,4 +209,5 @@ export {
   API_URL,
   RATE_LIMIT_WINDOW_MS,
   RATE_LIMIT_MAX_REQUESTS,
+  TRUST_PROXY_HOPS,
 };

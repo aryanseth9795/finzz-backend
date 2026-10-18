@@ -27,6 +27,10 @@ type GuardRow = Pick<
  *  - per IP: 5 guesses within a 1 h window lock that IP for 15 min; every
  *    further lock doubles (15, 30, 60 ... capped at 24 h). IPv6 addresses
  *    share a bucket per subnet. A success clears the IP.
+ *    The window is FIXED (anchored at the bucket's first attempt), not rolling:
+ *    an attacker can spend 4 guesses at the end of one window and 4 more at the
+ *    start of the next. That is accepted because the global cap and the
+ *    doubling lock escalation bound the overall guess rate regardless.
  *  - global: 30 guesses from any IPs within a 1 h window pause every admin
  *    login for 30 min; every further lock doubles (capped at 24 h) and the
  *    escalation decays after 24 h without a lock. IPs listed in
@@ -72,6 +76,11 @@ export interface ReserveResult extends LockStatus {
    * caller answers 429 (the lock is already in force).
    */
   attemptsLeft: number;
+  /**
+   * The time this attempt was reserved at. Pass it to `recordSuccess` so a
+   * success only gives back a global slot in the window it was taken from.
+   */
+  reservedAt: number;
 }
 
 /** Duration of the Nth IP lock (0-based): 15 min, 30, 60 ... capped at 24 h. */
@@ -88,15 +97,26 @@ const secondsUntil = (until: Date | number, now: number) =>
 const expiry = (now: number, lockedUntil?: number) =>
   new Date(Math.max(now, lockedUntil ?? 0) + GUARD_ROW_TTL_MS);
 
+/**
+ * Canonical form for the allowlist comparison: trimmed, lower-case, and an
+ * IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, what a dual-stack socket reports
+ * for an IPv4 client) reduced to plain `a.b.c.d`.
+ */
+const normaliseIp = (ip: string): string => {
+  const value = ip.trim().toLowerCase();
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(value);
+  return mapped ? mapped[1] : value;
+};
+
 /** Listed IPs skip the global lock only. Read per call so tests can change it. */
 const isAllowlisted = (ip: string): boolean => {
   const raw = process.env.ADMIN_LOGIN_ALLOWLIST_IPS;
   if (!raw) return false;
-  const wanted = ip.trim().toLowerCase();
+  const wanted = normaliseIp(ip);
   return raw
     .split(",")
-    .map((entry) => entry.trim().toLowerCase())
-    .some((entry) => entry !== "" && entry === wanted);
+    .map((entry) => entry.trim())
+    .some((entry) => entry !== "" && normaliseIp(entry) === wanted);
 };
 
 const describeLock = (ms: number) => {
@@ -193,30 +213,33 @@ const applyLock = async (
   return locked ? until : null;
 };
 
-/** When does this key's current lock end (0 when it is not locked)? */
-const lockEnd = async (key: string, now: number): Promise<number> => {
-  const doc = (await AdminLoginGuard.findOne({
-    key,
-  }).lean()) as unknown as GuardRow | null;
-  const until = doc?.lockedUntil?.getTime() ?? 0;
-  return until > now ? until : 0;
+/**
+ * When does the LATEST current lock among `keys` end (0 when none is locked)?
+ * Reporting the later of overlapping IP and global locks keeps Retry-After
+ * honest: retrying when the earlier one ends would only be refused again.
+ */
+const lockEnd = async (keys: string[], now: number): Promise<number> => {
+  const docs = (await AdminLoginGuard.find({
+    key: { $in: keys },
+  }).lean()) as unknown as GuardRow[];
+  let until = 0;
+  for (const doc of docs) {
+    const end = doc.lockedUntil?.getTime() ?? 0;
+    if (end > now) until = Math.max(until, end);
+  }
+  return until;
 };
 
-/** Is this IP (or the whole admin login) currently locked? Read-only. */
+/**
+ * TEST-ONLY: is this IP (or the whole admin login) currently locked? Read-only.
+ * The login path never calls this (it must reserve atomically instead, see
+ * `reserveAttempt`), so do not use it to gate a login.
+ */
 export const checkLock = async (
   ip: string,
   now: number = Date.now(),
 ): Promise<LockStatus> => {
-  const docs = await AdminLoginGuard.find({
-    key: { $in: [guardKeyForIp(ip), GLOBAL_KEY] },
-  }).lean();
-
-  let until = 0;
-  for (const doc of docs) {
-    if (doc.lockedUntil && doc.lockedUntil.getTime() > now) {
-      until = Math.max(until, doc.lockedUntil.getTime());
-    }
-  }
+  const until = await lockEnd([guardKeyForIp(ip), GLOBAL_KEY], now);
   if (until === 0) return { locked: false, retryAfterSeconds: 0 };
   return { locked: true, retryAfterSeconds: secondsUntil(until, now) };
 };
@@ -226,6 +249,7 @@ const refuse = (untilMs: number, now: number): ReserveResult => ({
   locked: true,
   retryAfterSeconds: Math.max(1, secondsUntil(untilMs, now)),
   attemptsLeft: 0,
+  reservedAt: now,
 });
 
 /**
@@ -240,39 +264,40 @@ export const reserveAttempt = async (
 ): Promise<ReserveResult> => {
   const skipGlobal = isAllowlisted(ip);
   const ipKey = guardKeyForIp(ip);
+  // Every lock that can refuse this IP; a refusal reports the latest of them.
+  const lockKeys = skipGlobal ? [ipKey] : [ipKey, GLOBAL_KEY];
+  const refuseLater = async () => refuse(await lockEnd(lockKeys, now), now);
 
   // A global pause refuses cheaply, without counting against anyone's IP.
-  if (!skipGlobal) {
-    const until = await lockEnd(GLOBAL_KEY, now);
-    if (until > 0) return refuse(until, now);
+  if (!skipGlobal && (await lockEnd([GLOBAL_KEY], now)) > 0) {
+    return refuseLater();
   }
 
-  // ── Per IP ────────────────────────────────────────────────────────────────
+  // ── Per IP: count ─────────────────────────────────────────────────────────
   const ipRow = await reserveRow(ipKey, IP_WINDOW_MS, now);
-  if (!ipRow) return refuse(await lockEnd(ipKey, now), now);
+  if (!ipRow) return refuseLater();
 
-  let ipLockedUntil = 0;
-  if (ipRow.failures >= IP_MAX_FAILURES) {
+  if (ipRow.failures > IP_MAX_FAILURES) {
+    // Beyond the cap: the permitted guesses are already in flight. No compare.
+    // Make sure the lock is in force (the attempt that hit the cap may not
+    // have applied it yet), then refuse.
     const duration = ipLockDurationMs(ipRow.lockCount);
-    const applied = await applyLock(ipKey, IP_MAX_FAILURES, duration, now);
-    if (applied) {
+    if (await applyLock(ipKey, IP_MAX_FAILURES, duration, now)) {
       console.warn(
         `[admin-login] per-IP lock tripped for ${ip}: locked for ${describeLock(duration)}`,
       );
     }
-    ipLockedUntil = applied ?? (await lockEnd(ipKey, now));
-    // Beyond the cap: the permitted guesses are already in flight. No compare.
-    if (ipRow.failures > IP_MAX_FAILURES) return refuse(ipLockedUntil, now);
+    return refuseLater();
   }
 
   // ── Global ────────────────────────────────────────────────────────────────
+  // Reserved BEFORE the per-IP lock is applied: an attempt the global step
+  // refuses is never compared, so it must neither lock nor escalate its IP.
   let globalLockedUntil = 0;
   if (!skipGlobal) {
     const globalRow = await reserveRow(GLOBAL_KEY, GLOBAL_WINDOW_MS, now);
-    let refusedUntil = 0;
-    if (!globalRow) {
-      refusedUntil = await lockEnd(GLOBAL_KEY, now);
-    } else if (globalRow.failures >= GLOBAL_MAX_FAILURES) {
+    let refused = !globalRow;
+    if (globalRow && globalRow.failures >= GLOBAL_MAX_FAILURES) {
       const duration = globalLockDurationMs(globalRow.lockCount);
       const applied = await applyLock(
         GLOBAL_KEY,
@@ -285,19 +310,30 @@ export const reserveAttempt = async (
           `[admin-login] global lock tripped (last attempt from ${ip}): all admin logins paused for ${describeLock(duration)}`,
         );
       }
-      globalLockedUntil = applied ?? (await lockEnd(GLOBAL_KEY, now));
-      if (globalRow.failures > GLOBAL_MAX_FAILURES) {
-        refusedUntil = globalLockedUntil;
-      }
+      globalLockedUntil = applied ?? (await lockEnd([GLOBAL_KEY], now));
+      refused = globalRow.failures > GLOBAL_MAX_FAILURES;
     }
-    if (!globalRow || refusedUntil > 0) {
+    if (refused) {
       // Never compared, so it must not eat this IP's own allowance.
       await AdminLoginGuard.updateOne(
         { key: ipKey, failures: { $gt: 0 } },
         { $inc: { failures: -1 } },
       );
-      return refuse(refusedUntil, now);
+      return refuseLater();
     }
+  }
+
+  // ── Per IP: lock ──────────────────────────────────────────────────────────
+  let ipLockedUntil = 0;
+  if (ipRow.failures === IP_MAX_FAILURES) {
+    const duration = ipLockDurationMs(ipRow.lockCount);
+    const applied = await applyLock(ipKey, IP_MAX_FAILURES, duration, now);
+    if (applied) {
+      console.warn(
+        `[admin-login] per-IP lock tripped for ${ip}: locked for ${describeLock(duration)}`,
+      );
+    }
+    ipLockedUntil = applied ?? (await lockEnd([ipKey], now));
   }
 
   const lockedUntil = Math.max(ipLockedUntil, globalLockedUntil);
@@ -306,21 +342,37 @@ export const reserveAttempt = async (
     locked: lockedUntil > now,
     retryAfterSeconds: lockedUntil > now ? secondsUntil(lockedUntil, now) : 0,
     attemptsLeft: Math.max(0, IP_MAX_FAILURES - ipRow.failures),
+    reservedAt: now,
   };
 };
 
 /**
  * A correct login clears that IP's counters and escalation, and gives back the
  * attempt it reserved on the global counter.
+ *
+ * `reservedAt` is the attempt's `ReserveResult.reservedAt`. The global slot is
+ * only given back when the current global window started at or before it: if
+ * the window rolled over since, the reservation was counted in an earlier
+ * window and decrementing would free a slot that was never taken.
  */
-export const recordSuccess = async (ip: string): Promise<void> => {
+export const recordSuccess = async (
+  ip: string,
+  reservedAt: number = Date.now(),
+): Promise<void> => {
+  // A correct login resets the WHOLE bucket (every address in the IPv6 subnet,
+  // or everyone behind the same NAT), not just this client. Accepted: only a
+  // holder of the credential can trigger it.
   await AdminLoginGuard.updateOne(
     { key: guardKeyForIp(ip) },
     { $set: { failures: 0, lockCount: 0, lockedUntil: null, windowStart: null } },
   );
   if (!isAllowlisted(ip)) {
     await AdminLoginGuard.updateOne(
-      { key: GLOBAL_KEY, failures: { $gt: 0 } },
+      {
+        key: GLOBAL_KEY,
+        failures: { $gt: 0 },
+        windowStart: { $lte: new Date(reservedAt) },
+      },
       { $inc: { failures: -1 } },
     );
   }

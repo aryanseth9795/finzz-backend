@@ -17,6 +17,8 @@ import { AdminLoginGuard } from "../src/models/adminLoginGuardModel.js";
 import {
   validateAdminSecret,
   wrongAdminCredentialMessage,
+  parseTrustProxyHops,
+  TRUST_PROXY_HOPS,
 } from "../src/config/envVariables.js";
 import {
   checkLock,
@@ -469,5 +471,150 @@ describe("digits-only PIN", () => {
       ok: true,
       kind: "secret",
     });
+  });
+});
+
+describe("TRUST_PROXY_HOPS", () => {
+  it("defaults to 1 when unset or blank, silently", () => {
+    const warn = vi.fn();
+    expect(parseTrustProxyHops(undefined, warn)).toBe(1);
+    expect(parseTrustProxyHops("", warn)).toBe(1);
+    expect(parseTrustProxyHops("   ", warn)).toBe(1);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("accepts a non-negative whole number of hops", () => {
+    const warn = vi.fn();
+    expect(parseTrustProxyHops("0", warn)).toBe(0);
+    expect(parseTrustProxyHops("1", warn)).toBe(1);
+    expect(parseTrustProxyHops(" 2 ", warn)).toBe(2);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each(["abc", "-1", "1.5", "true", "2x", "1e3"])(
+    "an invalid value (%s) warns once and falls back to 1",
+    (raw) => {
+      const warn = vi.fn();
+      expect(parseTrustProxyHops(raw, warn)).toBe(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toMatch(/TRUST_PROXY_HOPS/);
+    },
+  );
+
+  it("the app trusts exactly that many proxy hops (default 1)", () => {
+    expect(TRUST_PROXY_HOPS).toBe(1);
+    expect(app.get("trust proxy")).toBe(TRUST_PROXY_HOPS);
+  });
+});
+
+describe("a refused attempt does not lock its IP (M3)", () => {
+  it("the IP's 5th attempt arrives while the global step refuses → no IP lock, lockCount unchanged", async () => {
+    const t = Date.now();
+    const ip = "22.0.0.1";
+    await AdminLoginGuard.create({
+      key: guardKeyForIp(ip),
+      failures: 4,
+      windowStart: new Date(t),
+      lockCount: 2,
+      expiresAt: new Date(t + 7 * 24 * 60 * MIN),
+    });
+    // The global cap is already used up but its lock has not landed yet (the
+    // 30th reservation is still in flight), so the cheap pre-check passes and
+    // the refusal comes from the global reservation itself.
+    await AdminLoginGuard.create({
+      key: "global",
+      failures: 30,
+      windowStart: new Date(t),
+      lockCount: 0,
+      expiresAt: new Date(t + 7 * 24 * 60 * MIN),
+    });
+    const r = await reserveAttempt(ip, t);
+    expect(r.allowed).toBe(false);
+    const doc = await AdminLoginGuard.findOne({ key: guardKeyForIp(ip) }).lean();
+    expect(doc!.lockedUntil).toBeNull();
+    expect(doc!.lockCount).toBe(2);
+    expect(doc!.failures).toBe(4);
+  });
+});
+
+describe("Retry-After reports the later lock (M4)", () => {
+  const seed = (key: string, t: number, lockMs: number) =>
+    AdminLoginGuard.create({
+      key,
+      failures: 0,
+      windowStart: null,
+      lockedUntil: new Date(t + lockMs),
+      lockCount: 1,
+      expiresAt: new Date(t + 7 * 24 * 60 * MIN),
+    });
+
+  it("IP locked for 24 h while global is locked for 30 min → 24 h", async () => {
+    const t = Date.now();
+    await seed(guardKeyForIp("23.0.0.1"), t, 24 * 60 * MIN);
+    await seed("global", t, 30 * MIN);
+    const r = await reserveAttempt("23.0.0.1", t);
+    expect(r.allowed).toBe(false);
+    expect(r.retryAfterSeconds).toBe(24 * 60 * 60);
+  });
+
+  it("IP locked for 15 min while global is locked for 30 min → 30 min", async () => {
+    const t = Date.now();
+    await seed(guardKeyForIp("23.0.0.2"), t, 15 * MIN);
+    await seed("global", t, 30 * MIN);
+    const r = await reserveAttempt("23.0.0.2", t);
+    expect(r.allowed).toBe(false);
+    expect(r.retryAfterSeconds).toBe(30 * 60);
+  });
+});
+
+describe("success only frees a global slot in its own window (M2)", () => {
+  it("reserveAttempt reports its reservation time", async () => {
+    const t = Date.now();
+    expect((await reserveAttempt("24.0.0.1", t)).reservedAt).toBe(t);
+  });
+
+  it("a success whose reservation predates the current window does not decrement it", async () => {
+    const t = Date.now();
+    const mine = await reserveAttempt("24.0.1.1", t);
+    // The global window rolls over before the success is recorded.
+    const later = t + 61 * MIN;
+    await reserveAttempt("24.0.1.2", later);
+    await recordSuccess("24.0.1.1", mine.reservedAt);
+    const g = await AdminLoginGuard.findOne({ key: "global" }).lean();
+    expect(g!.failures).toBe(1);
+  });
+
+  it("a success inside the current window gives its slot back", async () => {
+    const t = Date.now();
+    await reserveAttempt("24.0.2.1", t);
+    const mine = await reserveAttempt("24.0.2.2", t + MIN);
+    await recordSuccess("24.0.2.2", mine.reservedAt);
+    const g = await AdminLoginGuard.findOne({ key: "global" }).lean();
+    expect(g!.failures).toBe(1);
+  });
+});
+
+describe("allowlist and IPv4-mapped addresses (M6)", () => {
+  afterEach(() => {
+    delete process.env.ADMIN_LOGIN_ALLOWLIST_IPS;
+  });
+
+  const tripGlobal = async (t: number) => {
+    for (let i = 0; i < 30; i++) await reserveAttempt(`25.0.0.${i}`, t);
+  };
+
+  it("::ffff:a.b.c.d matches a plain a.b.c.d entry", async () => {
+    process.env.ADMIN_LOGIN_ALLOWLIST_IPS = "25.1.0.1";
+    const t = Date.now();
+    await tripGlobal(t);
+    expect((await reserveAttempt("::ffff:25.1.0.1", t + MIN)).allowed).toBe(true);
+    expect((await reserveAttempt("::FFFF:25.1.0.9", t + MIN)).allowed).toBe(false);
+  });
+
+  it("an ::ffff:a.b.c.d entry matches the plain address", async () => {
+    process.env.ADMIN_LOGIN_ALLOWLIST_IPS = "::ffff:25.1.0.2";
+    const t = Date.now();
+    await tripGlobal(t);
+    expect((await reserveAttempt("25.1.0.2", t + MIN)).allowed).toBe(true);
   });
 });

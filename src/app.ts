@@ -16,7 +16,7 @@ import notificationRoutes from "./routes/notificationRoutes.js";
 import appRoutes from "./routes/appRoutes.js";
 import noteRoutes from "./routes/noteRoutes.js";
 
-import { CLIENT_ORIGINS } from "./config/envVariables.js";
+import { CLIENT_ORIGINS, TRUST_PROXY_HOPS } from "./config/envVariables.js";
 import { apiLimiter } from "./middlewares/rateLimit.js";
 import errorMiddleware from "./middlewares/error.js";
 import ErrorHandler from "./middlewares/Errorhandler.js";
@@ -37,7 +37,8 @@ const app = express();
 // Render/Heroku-style platforms terminate TLS at a proxy. Without this,
 // `req.ip` is the proxy's address, which would make every rate limiter treat
 // all traffic as one client, and `secure` cookies would be misjudged.
-app.set("trust proxy", 1);
+// The hop count must match the real number of proxies (TRUST_PROXY_HOPS).
+app.set("trust proxy", TRUST_PROXY_HOPS);
 
 // Baseline security headers: HSTS, nosniff, frameguard, referrer policy.
 // `contentSecurityPolicy` is disabled because this process serves only JSON —

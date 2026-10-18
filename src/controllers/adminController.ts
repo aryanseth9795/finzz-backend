@@ -104,7 +104,7 @@ export const adminLogin = TryCatch(
       });
     }
 
-    await recordSuccess(ip);
+    await recordSuccess(ip, attempt.reservedAt);
     const token = signAdminToken();
 
     res
