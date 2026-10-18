@@ -687,7 +687,8 @@ export const getAdvancedStats = TryCatch(
       }))
       .sort((a, b) => b.total - a.total);
 
-    // ── 3b. Category trend: top 6 categories x last 3 months (zero-filled) ──
+    // ── 3b. Category trend: top 7 categories x last 3 months (zero-filled) ──
+    // 7 matches the screen's category list.
     const monthKeys = trendMonths.map(
       (m) => `${m.year}-${String(m.month).padStart(2, "0")}`,
     );
@@ -701,7 +702,7 @@ export const getAdvancedStats = TryCatch(
       const byMonth = (trendTotals[label] ??= {});
       byMonth[key] = (byMonth[key] ?? 0) + exp.amount;
     }
-    const categoryTrend = categoryBreakdown.slice(0, 6).map((c) => ({
+    const categoryTrend = categoryBreakdown.slice(0, 7).map((c) => ({
       name: c.name,
       months: monthKeys.map((key) => ({
         month: key,
@@ -710,6 +711,8 @@ export const getAdvancedStats = TryCatch(
     }));
 
     // ── 4. Top 5 Expenses for selected month ──
+    // `category` is already resolved with the shared rule (#tag > category >
+    // "Other") so clients needn't re-derive it.
     const top5 = [...debitExpenses]
       .sort((a, b) => b.amount - a.amount)
       .slice(0, 5)
@@ -718,7 +721,7 @@ export const getAdvancedStats = TryCatch(
         amount: e.amount,
         date: e.date,
         remarks: e.remarks || "",
-        category: e.category || "",
+        category: expenseCategoryOf(e),
         type: e.type,
       }));
 

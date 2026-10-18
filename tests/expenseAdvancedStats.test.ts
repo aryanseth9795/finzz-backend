@@ -117,12 +117,12 @@ describe("getAdvancedStats: categoryTrend", () => {
     ]);
   });
 
-  it("wraps across the year boundary and caps at 6 categories", async () => {
-    for (let i = 0; i < 8; i++) {
+  it("wraps across the year boundary and caps at 7 categories", async () => {
+    for (let i = 0; i < 9; i++) {
       await insert({ amount: 10 + i, category: `c${i}`, date: "2026-01-05T06:00:00Z" });
     }
     const d = await stats({ year: 2026, month: 1 });
-    expect(d.categoryTrend).toHaveLength(6);
+    expect(d.categoryTrend).toHaveLength(7);
     expect(d.categoryTrend[0].months.map((m: { month: string }) => m.month)).toEqual([
       "2025-11",
       "2025-12",
@@ -157,6 +157,25 @@ describe("getAdvancedStats: categoryTrend", () => {
     await insert({ amount: 70, category: "food", date: "2026-09-30T19:00:00Z" });
     const d = await stats({ year: 2026, month: 10, tzOffsetMinutes: 330 });
     expect(d.categoryTrend[0].months[2]).toEqual({ month: "2026-10", total: 70 });
+  });
+});
+
+describe("getAdvancedStats: top5 resolved category", () => {
+  it("resolves category via expenseCategoryOf (tag, fallback, Other)", async () => {
+    await insert({ amount: 500, category: "food", remarks: "#travel", date: "2026-10-05T06:00:00Z" });
+    await insert({ amount: 400, category: "rent", remarks: "monthly", date: "2026-10-06T06:00:00Z" });
+    await Expense.collection.insertOne({
+      userId: new mongoose.Types.ObjectId(alice.id),
+      ledgerId: new mongoose.Types.ObjectId(),
+      amount: 300,
+      type: "debit",
+      remarks: "no category",
+      date: new Date("2026-10-07T06:00:00Z"),
+    });
+    const d = await stats({ year: 2026, month: 10 });
+    expect(
+      d.top5Expenses.map((e: { category: string }) => e.category),
+    ).toEqual(["travel", "rent", "Other"]);
   });
 });
 

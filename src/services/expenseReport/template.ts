@@ -269,6 +269,7 @@ h2 { font-size: 15px; margin: 26px 0 10px; letter-spacing: 0.01em; break-after: 
 }
 .wordmark { color: ${COLORS.spend}; font-weight: 800; font-size: 18px; letter-spacing: 0.02em; }
 .hero-sentence { font-size: 28px; line-height: 1.2; font-weight: 800; margin: 10px 0 8px; }
+.hero-sentence.neutral { color: ${COLORS.ink}; }
 .hero-sub { font-size: 14px; color: #374151; }
 .pill {
   display: inline-block;
@@ -360,7 +361,15 @@ table.tx tbody tr:nth-child(even) td { background: #F9FAFB; }
 // Sections
 // ---------------------------------------------------------------------------
 
-function heroSentence(net: number, label: string): string {
+/**
+ * With no income there is nothing to "overspend" against, so the headline is
+ * a neutral statement of spend (shown in the neutral ink colour).
+ */
+function heroSentence(totals: ExpenseReportData["totals"], label: string): string {
+  if (round2(totals.received) < EPSILON) {
+    return `You spent ${formatCurrency(round2(totals.spent))} in ${label}`;
+  }
+  const net = totals.net;
   const v = round2(Math.abs(net));
   if (v < EPSILON) return `You broke even in ${label}`;
   return net > 0
@@ -371,13 +380,14 @@ function heroSentence(net: number, label: string): string {
 function heroSection(data: ExpenseReportData): string {
   const { totals, period } = data;
   const rate = totals.savingsRate;
+  const neutral = round2(totals.received) < EPSILON;
   const pill =
     rate === null
       ? html`<span class="pill">No income recorded</span>`
       : html`<span class="pill ${rate >= 0 ? "pos" : "neg"}">Savings rate ${r1(rate)}%</span>`;
   return html`<header class="hero">
   <div class="wordmark">Finzz</div>
-  <div class="hero-sentence">${heroSentence(totals.net, period.label)}</div>
+  <div class="hero-sentence${neutral ? " neutral" : ""}">${heroSentence(totals, period.label)}</div>
   <div class="hero-sub">${data.userName} · ${period.label} · ${data.status === "closed" ? "Closed" : "Open"}</div>
   ${raw(pill)}
 </header>`;

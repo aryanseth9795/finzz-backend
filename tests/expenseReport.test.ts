@@ -169,4 +169,31 @@ describe("Expense PDF export", () => {
     expect(html).not.toMatch(/<(link|img)\b/i);
     expect(html).not.toContain(alice.phone);
   });
+
+  it("uses a neutral 'You spent' headline when nothing was received", async () => {
+    await addExpense({ amount: 1500, date: "2026-10-10T06:00:00.000Z", category: "Food" });
+
+    const html = await exportHtml();
+    const hero = html.match(/<div class="hero-sentence[^"]*">([^<]*)<\/div>/);
+    expect(hero).not.toBeNull();
+    expect(hero![1]).toMatch(/^You spent .*1,500.* in October 2026$/);
+    expect(hero![1]).not.toMatch(/overspent/i);
+    expect(html).toMatch(/\.hero-sentence\.neutral\s*\{\s*color:\s*#111827/);
+    expect(html).toMatch(/class="hero-sentence neutral"/);
+  });
+
+  it("keeps 'overspent' when income exists but spending is higher", async () => {
+    await addExpense({ amount: 1500, date: "2026-10-10T06:00:00.000Z", category: "Food" });
+    await addExpense({
+      amount: 500,
+      date: "2026-10-11T06:00:00.000Z",
+      type: "credit",
+      remarks: "salary",
+    });
+
+    const html = await exportHtml();
+    const hero = html.match(/<div class="hero-sentence[^"]*">([^<]*)<\/div>/);
+    expect(hero![1]).toMatch(/overspent/i);
+    expect(html).not.toMatch(/class="hero-sentence neutral"/);
+  });
 });
