@@ -19,6 +19,7 @@ export async function updateSummaryOnAdd(
   fromUserId: string,
   toUserId: string,
   amount: number,
+  session?: mongoose.ClientSession,
 ) {
   const { year, month } = getYearMonth(txDate);
 
@@ -31,7 +32,7 @@ export async function updateSummaryOnAdd(
         txCount: 1,
       },
     },
-    { upsert: true },
+    { upsert: true, session },
   );
 }
 
@@ -45,6 +46,7 @@ export async function updateSummaryOnDelete(
   fromUserId: string,
   toUserId: string,
   amount: number,
+  session?: mongoose.ClientSession,
 ) {
   const { year, month } = getYearMonth(txDate);
 
@@ -57,6 +59,7 @@ export async function updateSummaryOnDelete(
         txCount: -1,
       },
     },
+    { session },
   );
 }
 
@@ -78,6 +81,7 @@ export async function updateSummaryOnEdit(
     to: string;
     amount: number;
   },
+  session?: mongoose.ClientSession,
 ) {
   const oldYM = getYearMonth(oldTx.date);
   const newYM = getYearMonth(newTx.date);
@@ -97,6 +101,7 @@ export async function updateSummaryOnEdit(
             [`members.${oldTx.to}.totalReceived`]: diff,
           },
         },
+        { session },
       );
     }
   } else {
@@ -107,6 +112,7 @@ export async function updateSummaryOnEdit(
       oldTx.from,
       oldTx.to,
       oldTx.amount,
+      session,
     );
     await updateSummaryOnAdd(
       chatId,
@@ -114,6 +120,7 @@ export async function updateSummaryOnEdit(
       newTx.from,
       newTx.to,
       newTx.amount,
+      session,
     );
   }
 }
