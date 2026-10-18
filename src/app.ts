@@ -69,10 +69,13 @@ app.get("/health", (_req, res) => {
 
 // Daily traffic counter (in-memory buffer, flushed to the DB on a timer).
 // `req.user` is read at response end, after isAuthenticated has had its say.
-// The admin panel's own calls are skipped so they don't inflate "requests".
+// The admin panel's own calls are skipped so they don't inflate "requests",
+// and so are rate-limited (429) responses, so a runaway client doesn't either.
 app.use("/api", (req, res, next) => {
   if (!req.originalUrl.startsWith("/api/v1/admin")) {
-    res.on("finish", () => recordRequest(!!req.user));
+    res.on("finish", () => {
+      if (res.statusCode !== 429) recordRequest(!!req.user);
+    });
   }
   next();
 });

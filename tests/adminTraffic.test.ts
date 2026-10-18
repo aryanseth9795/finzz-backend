@@ -22,6 +22,7 @@ import {
   DailyTraffic,
 } from "../src/models/dailyActivityModel.js";
 import { User } from "../src/models/userModel.js";
+import { PushTicket } from "../src/models/pushTicketModel.js";
 
 beforeAll(async () => {
   await connect();
@@ -270,5 +271,25 @@ describe("DELETE /admin/users/:id purges activity", () => {
 
     expect(await DailyActivity.countDocuments({ user: vid })).toBe(0);
     expect(await DailyActivity.countDocuments({ user: otherId })).toBe(1);
+  });
+});
+
+describe("DELETE /admin/users/:id purges push tickets", () => {
+  it("removes the user's PushTicket rows and leaves others", async () => {
+    const cookie = await adminCookie();
+    const victim = await registerUser(app);
+    const other = await registerUser(app);
+    await PushTicket.create([
+      { ticketId: "t-victim-1", token: "ExponentPushToken[v1]", userId: victim.id },
+      { ticketId: "t-other-1", token: "ExponentPushToken[o1]", userId: other.id },
+    ]);
+
+    await request(app)
+      .delete(`/api/v1/admin/users/${victim.id}`)
+      .set("Cookie", cookie)
+      .expect(200);
+
+    expect(await PushTicket.countDocuments({ userId: victim.id })).toBe(0);
+    expect(await PushTicket.countDocuments({ userId: other.id })).toBe(1);
   });
 });

@@ -340,3 +340,20 @@ describe("ANALYTICS_TZ_OFFSET_MINUTES validation", () => {
     expect(await load(undefined)).toHaveLength(0);
   });
 });
+
+describe("rate-limited requests are not counted as traffic", () => {
+  it("skips 429 responses", async () => {
+    // authLimiter allows 10 failed logins per 15 min per IP+phone; the 11th is a 429.
+    const phone = "+919000012345";
+    for (let i = 0; i < 10; i++) {
+      await request(app).post("/api/v1/users/login").send({ phone, password: "wrong" }).expect(401);
+    }
+    await request(app).post("/api/v1/users/login").send({ phone, password: "wrong" }).expect(429);
+    await settle();
+    await flushActivity();
+
+    const rows = await DailyTraffic.find().lean();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].requests).toBe(10);
+  });
+});

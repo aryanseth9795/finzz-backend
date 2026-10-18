@@ -14,6 +14,7 @@ import {
   startActivityFlush,
 } from "./src/services/activityTracker.js";
 import { processPushReceipts } from "./src/services/pushReceipts.js";
+import { flushPendingPushWork } from "./src/services/notificationService.js";
 
 /**
  * Process bootstrap. The Express application itself lives in `src/app.ts` and
@@ -103,6 +104,12 @@ const start = async () => {
         await flushActivity();
       } catch (error) {
         console.error("[shutdown] error flushing activity:", error);
+      }
+      try {
+        // Let in-flight push ticket bookkeeping finish before the DB closes.
+        await flushPendingPushWork();
+      } catch (error) {
+        console.error("[shutdown] error flushing push work:", error);
       }
       try {
         await mongoose.connection.close(false);

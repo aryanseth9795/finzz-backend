@@ -30,6 +30,7 @@ import {
   recentDeliveryStats,
 } from "../services/pushReceipts.js";
 import { PoolTx } from "../models/poolTxModel.js";
+import { PushTicket } from "../models/pushTicketModel.js";
 import {
   DailyActivity,
   DailyTraffic,
@@ -495,6 +496,9 @@ export const deleteUser = TryCatch(
 
           // Per-user traffic analytics.
           DailyActivity.deleteMany({ user: userId }, { session }),
+
+          // Push tickets hold the user's device tokens.
+          PushTicket.deleteMany({ userId }, { session }),
         ]);
 
         // Chats are 1:1, so a chat the user belonged to has no meaning without
