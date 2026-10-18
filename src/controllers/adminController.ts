@@ -1,5 +1,6 @@
 import { NextFunction, Request, Response } from "express";
 import mongoose from "mongoose";
+import { Expo } from "expo-server-sdk";
 import crypto from "crypto";
 import TryCatch from "../utils/TryCatch.js";
 import { User } from "../models/userModel.js";
@@ -24,6 +25,10 @@ import {
   broadcastPushNotification,
   sendBulkPushNotifications,
 } from "../services/notificationService.js";
+import {
+  processPushReceipts,
+  recentDeliveryStats,
+} from "../services/pushReceipts.js";
 import { PoolTx } from "../models/poolTxModel.js";
 import {
   DailyActivity,
@@ -756,8 +761,8 @@ export const sendBulkNotification = TryCatch(
     res.status(200).json({
       success: true,
       message:
-        `Delivered to ${report.accepted} device(s) across ${report.recipients} user(s); ` +
-        `${report.rejected} rejected.`,
+        `Queued ${report.accepted} notification(s) at Expo. ` +
+        `Delivery is confirmed within ~25 minutes, or press Check now.`,
       // Three distinct numbers, because they mean three different things.
       // `sentCount` previously counted messages *submitted* to Expo and was
       // reported to the operator as a delivery count.
@@ -794,35 +799,97 @@ export const sendTargetedNotification = TryCatch(
       return next(new ErrorHandler("One or more user ids are invalid", 400));
     }
 
-    const report = await sendBulkPushNotifications(
-      userIds.map((userId: string) => ({
-        userId,
-        title,
-        body,
-        data: { type: "admin_targeted" },
-      })),
-    );
-
-    if (report.accepted === 0 && report.rejected === 0) {
-      return next(
-        new ErrorHandler(
-          "None of the selected users have valid push tokens",
-          404,
+    try {
+      // Distinguish "nobody has a device" from "the send ran" so the admin sees
+      // an accurate reason instead of a generic failure.
+      const recipients = await User.find({ _id: { $in: userIds } })
+        .select("pushTokens pushToken")
+        .lean();
+      const withDevice = recipients.filter((u: any) =>
+        [...(u.pushTokens ?? []), u.pushToken].some(
+          (t) => typeof t === "string" && Expo.isExpoPushToken(t),
         ),
+      ).length;
+
+      if (withDevice === 0) {
+        return next(
+          new ErrorHandler(
+            "None of the selected users has a device registered for notifications",
+            404,
+          ),
+        );
+      }
+
+      const report = await sendBulkPushNotifications(
+        userIds.map((userId: string) => ({
+          userId,
+          title,
+          body,
+          data: { type: "admin_targeted" },
+        })),
       );
+
+      if (report.error) {
+        console.error("[admin] sendTargetedNotification send failed:", report.error);
+        return next(new ErrorHandler("Failed to send the notification", 500));
+      }
+
+      let message = `Queued ${report.accepted} notification(s) at Expo`;
+      if (report.rejected > 0) message += `; ${report.rejected} rejected`;
+      if (report.skipped > 0) {
+        message += `; ${report.skipped} user(s) skipped (no device or send failed)`;
+      }
+
+      res.status(200).json({
+        success: true,
+        message,
+        totalSelectedUsers: userIds.length,
+        accepted: report.accepted,
+        rejected: report.rejected,
+        skipped: report.skipped,
+        /** @deprecated use `accepted`. */
+        sentCount: report.accepted,
+      });
+    } catch (error) {
+      console.error("[admin] sendTargetedNotification failed:", error);
+      return next(new ErrorHandler("Failed to send the notification", 500));
+    }
+  },
+);
+
+// ==========================================
+// Push delivery health (last 24h)
+// ==========================================
+export const getNotificationHealth = TryCatch(
+  async (req: Request, res: Response) => {
+    let checkFailed: boolean | undefined;
+    if (req.query.check === "1") {
+      const run = await processPushReceipts({ olderThanMs: 0 });
+      checkFailed = run.fetchFailed > 0;
+    }
+
+    const last24h = await recentDeliveryStats();
+    const codes = Object.keys(last24h.errors);
+
+    let hint: string | null = null;
+    if (
+      codes.includes("InvalidCredentials") ||
+      codes.includes("MismatchSenderId")
+    ) {
+      hint =
+        "Expo can't deliver to Android: the FCM V1 credential for this app is missing or belongs to another Firebase project. Upload the Firebase service-account key for project finzz-1e22b with `eas credentials` (Android → Push Notifications: FCM V1).";
+    } else if (codes.length > 0 && codes.every((c) => c === "DeviceNotRegistered")) {
+      hint =
+        "Some devices uninstalled the app or changed tokens; they were removed automatically.";
+    } else if (last24h.total === 0) {
+      hint = "No pushes were sent in the last 24 hours.";
     }
 
     res.status(200).json({
       success: true,
-      message:
-        `Delivered to ${report.accepted} device(s); ${report.rejected} rejected, ` +
-        `${report.skipped} of ${userIds.length} selected user(s) had no push token.`,
-      totalSelectedUsers: userIds.length,
-      accepted: report.accepted,
-      rejected: report.rejected,
-      skipped: report.skipped,
-      /** @deprecated use `accepted`. */
-      sentCount: report.accepted,
+      last24h,
+      hint,
+      ...(checkFailed === undefined ? {} : { checkFailed }),
     });
   },
 );

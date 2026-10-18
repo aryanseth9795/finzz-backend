@@ -28,6 +28,7 @@ import {
   getAdminPoolDetail,
   sendBulkNotification,
   sendTargetedNotification,
+  getNotificationHealth,
 } from "../controllers/adminController.js";
 import {
   getAdminRelease,
@@ -121,6 +122,8 @@ router.post(
   validate(targetedNotificationSchema),
   sendTargetedNotification,
 );
+
+router.get("/notifications/health", adminOnly, getNotificationHealth);
 
 // App release — PUT can block every install below the minimum, so it is validated.
 router.get("/app-release", adminOnly, getAdminRelease);
