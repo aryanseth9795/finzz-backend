@@ -1,5 +1,6 @@
 import ErrorHandler from "./Errorhandler.js";
 import { NextFunction, Request, Response } from "express";
+import { recordActivity } from "../services/activityTracker.js";
 import {
   verifyAccessToken,
   verifyAdminToken,
@@ -27,6 +28,16 @@ const isAuthenticated = (req: Request, res: Response, next: NextFunction) => {
   try {
     const decoded = verifyAccessToken(token);
     req.user = { id: decoded.id };
+    try {
+      // The app's cold start calls GET /users/profile; that counts as an open.
+      recordActivity(decoded.id, {
+        isOpen:
+          req.method === "GET" &&
+          req.originalUrl.split("?")[0] === "/api/v1/users/profile",
+      });
+    } catch {
+      // Analytics must never fail a request.
+    }
     next();
   } catch (error) {
     // 401 for every JWT failure (expired, invalid, wrong type) so the client

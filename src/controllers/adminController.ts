@@ -21,6 +21,16 @@ import {
   sendBulkPushNotifications,
 } from "../services/notificationService.js";
 import { PoolTx } from "../models/poolTxModel.js";
+import {
+  DailyActivity,
+  DailyTraffic,
+} from "../models/dailyActivityModel.js";
+import {
+  dayKey,
+  flushActivity,
+  ANALYTICS_TZ_OFFSET_MINUTES,
+} from "../services/activityTracker.js";
+import { adminTrafficQuerySchema } from "../middlewares/validation.js";
 
 /**
  * Cookie options for the admin session.
@@ -432,6 +442,9 @@ export const deleteUser = TryCatch(
             { $set: { personLabel: null } },
             { session },
           ),
+
+          // Per-user traffic analytics.
+          DailyActivity.deleteMany({ user: userId }, { session }),
         ]);
 
         // Chats are 1:1, so a chat the user belonged to has no meaning without
@@ -765,6 +778,145 @@ export const sendTargetedNotification = TryCatch(
       skipped: report.skipped,
       /** @deprecated use `accepted`. */
       sentCount: report.accepted,
+    });
+  },
+);
+
+// ==========================================
+// Traffic analytics
+// ==========================================
+
+/** "+05:30" style offset string for Mongo's `$dateToString` timezone. */
+const tzOffsetString = (minutes: number): string => {
+  const sign = minutes < 0 ? "-" : "+";
+  const abs = Math.abs(minutes);
+  const hh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const mm = String(abs % 60).padStart(2, "0");
+  return `${sign}${hh}:${mm}`;
+};
+
+export const getTrafficAnalytics = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    // Express 5: validate() cannot write the coerced query back, so re-parse.
+    const { days } = adminTrafficQuerySchema.parse({ query: req.query }).query;
+
+    // Make today's buffered counts visible to the queries below.
+    await flushActivity();
+
+    const DAY_MS = 86_400_000;
+    const now = Date.now();
+    const dayAt = (ago: number) => dayKey(new Date(now - ago * DAY_MS));
+    const today = dayAt(0);
+    const dayList = Array.from({ length: days }, (_, i) => dayAt(days - 1 - i));
+    const firstDay = dayList[0];
+    const weekStart = dayAt(6);
+    const monthStart = dayAt(29);
+
+    // Start of the first local day, as a UTC instant.
+    const rangeStart = new Date(
+      Date.parse(`${firstDay}T00:00:00.000Z`) -
+        ANALYTICS_TZ_OFFSET_MINUTES * 60_000,
+    );
+
+    const [perDay, traffic, newUsersPerDay, wauAgg, mauAgg, top, firstTraffic] =
+      await Promise.all([
+        DailyActivity.aggregate([
+          { $match: { day: { $gte: firstDay, $lte: today } } },
+          {
+            $group: {
+              _id: "$day",
+              activeUsers: { $sum: 1 },
+              opens: { $sum: "$opens" },
+            },
+          },
+        ]),
+        DailyTraffic.find({ day: { $gte: firstDay, $lte: today } })
+          .select("day requests")
+          .lean(),
+        User.aggregate([
+          { $match: { createdAt: { $gte: rangeStart } } },
+          {
+            $group: {
+              _id: {
+                $dateToString: {
+                  format: "%Y-%m-%d",
+                  date: "$createdAt",
+                  timezone: tzOffsetString(ANALYTICS_TZ_OFFSET_MINUTES),
+                },
+              },
+              count: { $sum: 1 },
+            },
+          },
+        ]),
+        DailyActivity.aggregate([
+          { $match: { day: { $gte: weekStart, $lte: today } } },
+          { $group: { _id: "$user" } },
+          { $count: "n" },
+        ]),
+        DailyActivity.aggregate([
+          { $match: { day: { $gte: monthStart, $lte: today } } },
+          { $group: { _id: "$user" } },
+          { $count: "n" },
+        ]),
+        DailyActivity.find({ day: today })
+          .sort({ requests: -1, lastSeenAt: -1 })
+          .limit(10)
+          .select("user requests opens lastSeenAt")
+          .lean(),
+        DailyTraffic.findOne().sort({ day: 1 }).select("day").lean(),
+      ]);
+
+    const activityByDay = new Map<string, { activeUsers: number; opens: number }>(
+      perDay.map((d: any) => [d._id, d]),
+    );
+    const requestsByDay = new Map<string, number>(
+      traffic.map((t) => [t.day, t.requests]),
+    );
+    const newUsersByDay = new Map<string, number>(
+      newUsersPerDay.map((d: any) => [d._id, d.count]),
+    );
+
+    const daysOut = dayList.map((date) => ({
+      date,
+      activeUsers: activityByDay.get(date)?.activeUsers ?? 0,
+      opens: activityByDay.get(date)?.opens ?? 0,
+      requests: requestsByDay.get(date) ?? 0,
+      newUsers: newUsersByDay.get(date) ?? 0,
+    }));
+
+    const todayRow = daysOut[daysOut.length - 1];
+    const dau = todayRow.activeUsers;
+    const wau: number = wauAgg[0]?.n ?? 0;
+    const mau: number = mauAgg[0]?.n ?? 0;
+
+    const topUsers = await User.find({ _id: { $in: top.map((t) => t.user) } })
+      .select("name")
+      .lean();
+    const nameById = new Map(topUsers.map((u) => [String(u._id), u.name]));
+
+    res.status(200).json({
+      success: true,
+      trackingSince: firstTraffic?.day ?? null,
+      today: {
+        activeUsers: todayRow.activeUsers,
+        opens: todayRow.opens,
+        requests: todayRow.requests,
+        newUsers: todayRow.newUsers,
+      },
+      totals: {
+        dau,
+        wau,
+        mau,
+        stickiness: mau ? Math.round((dau / mau) * 1000) / 1000 : 0,
+      },
+      days: daysOut,
+      topToday: top.map((t) => ({
+        userId: String(t.user),
+        name: nameById.get(String(t.user)) ?? "Unknown",
+        requests: t.requests,
+        opens: t.opens,
+        lastSeenAt: t.lastSeenAt,
+      })),
     });
   },
 );
