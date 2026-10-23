@@ -75,7 +75,14 @@ export const revokeAllRefreshGrants = async (userId: string): Promise<void> => {
   );
 };
 
-/** Shape returned to clients. Never includes password, otp, or token records. */
+/**
+ * Shape returned to clients. Never includes password, otp, or token records.
+ *
+ * `expenseCategoriesVersion` lets the app sync its saved category list right
+ * after login or registration, which don't go through the launch Profile call.
+ * The key is left out when the field is missing, so an account older than the
+ * feature still reads as "never filled" and the app runs the first fill.
+ */
 export const publicUser = (user: IUser) => ({
   _id: user._id,
   name: user.name,
@@ -83,6 +90,9 @@ export const publicUser = (user: IUser) => ({
   avatar: user.avatar,
   email: user.email,
   emailVerified: user.emailVerified,
+  ...(typeof user.expenseCategoriesVersion === "number"
+    ? { expenseCategoriesVersion: user.expenseCategoriesVersion }
+    : {}),
 });
 
 const sendToken = async (
