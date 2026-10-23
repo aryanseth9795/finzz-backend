@@ -50,6 +50,12 @@ export interface IUser extends Document {
   refreshTokens: IRefreshTokenGrant[];
   /** @deprecated Legacy single refresh token. Accepted during grace period. */
   refreshToken?: string;
+  /**
+   * Counter for the saved expense-category list. Missing = never filled (an
+   * account older than the feature), 0 = filled and empty, then +1 on every
+   * real insert or delete. The app compares it with its own copy at launch.
+   */
+  expenseCategoriesVersion?: number;
   createdAt: Date;
   updatedAt: Date;
   comparePassword(candidatePassword: string): Promise<boolean>;
@@ -158,6 +164,14 @@ const userSchema = new Schema<IUser>(
     refreshToken: {
       type: String,
       select: false,
+    },
+    // Deliberately NO default. Mongoose applies schema defaults to documents
+    // as they are read, so a default of 0 would make every existing account
+    // look "filled and empty" and its one-time first fill would never run.
+    // Registration sets 0 explicitly instead.
+    expenseCategoriesVersion: {
+      type: Number,
+      min: 0,
     },
   },
   {

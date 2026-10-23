@@ -13,6 +13,11 @@ import {
   daysInMonth,
 } from "../utils/dates.js";
 import { expenseCategoryOf } from "../services/expenseReport/category.js";
+import {
+  addCategoryIfNew,
+  isStorableCategory,
+  type CategoryDTO,
+} from "../services/expenseCategories.js";
 import { renderExpenseReportHtml } from "../services/expenseReport/template.js";
 import { decodeCursor, cursorFilter, paginate } from "../utils/cursor.js";
 
@@ -62,7 +67,7 @@ export const addExpense = TryCatch(
     // (addExpenseSchema). It used to be the raw body value with no schema on
     // the route at all, which is how `ledger.totalExpenses += amount` came to
     // evaluate `50 + "100"` as the string "50100".
-    const { amount, date, remarks, category, type } = req.body;
+    const { amount, date, remarks, category, type, newCategory } = req.body;
     const userId = req.user.id;
     const tzOffset = parseTzOffset(req.body.tzOffsetMinutes);
 
@@ -70,6 +75,10 @@ export const addExpense = TryCatch(
     const expenseDate = new Date(date);
 
     let expense;
+    // Cast so TypeScript does not narrow them to their initial values across
+    // the transaction callback that assigns them.
+    let savedCategory = null as CategoryDTO | null;
+    let categoriesVersion = undefined as number | undefined;
 
     /**
      * The expense row and the ledger total are one fact recorded in two places,
@@ -80,6 +89,11 @@ export const addExpense = TryCatch(
     const session = await mongoose.startSession();
     try {
       await session.withTransaction(async () => {
+        // `withTransaction` re-runs this callback on a write conflict; start
+        // each run clean so an aborted attempt's category never leaks out.
+        savedCategory = null;
+        categoriesVersion = undefined;
+
         const ledger = await getOrCreateLedger(
           userId,
           expenseDate,
@@ -94,6 +108,26 @@ export const addExpense = TryCatch(
           );
         }
 
+        /**
+         * The phone flags a category it does not have saved (spec 6.3). It is
+         * added in THIS transaction so the expense and its chip land together.
+         * When the name already exists the expense takes the stored spelling,
+         * so "groceries" from an out-of-date phone saves as "Groceries".
+         * At the limit the service returns no category and the expense keeps
+         * the typed text: the category logic never fails a save. Unflagged
+         * saves never read or write the category table.
+         */
+        if (newCategory && isStorableCategory(category)) {
+          const result = await addCategoryIfNew(
+            userId,
+            expenseType,
+            category,
+            session,
+          );
+          savedCategory = result.category;
+          categoriesVersion = result.version;
+        }
+
         const created = await Expense.create(
           [
             {
@@ -103,7 +137,7 @@ export const addExpense = TryCatch(
               type: expenseType,
               date: expenseDate,
               remarks,
-              category,
+              category: savedCategory ? savedCategory.name : category,
             },
           ],
           { session },
@@ -141,6 +175,8 @@ export const addExpense = TryCatch(
       success: true,
       message: "Expense added successfully",
       expense,
+      ...(savedCategory ? { category: savedCategory } : {}),
+      ...(categoriesVersion !== undefined ? { categoriesVersion } : {}),
     });
   },
 );
@@ -192,7 +228,7 @@ export const editExpense = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { id } = req.params;
     const userId = req.user.id;
-    const { amount, date, remarks, category, type } = req.body;
+    const { amount, date, remarks, category, type, newCategory } = req.body;
 
     const expense = await Expense.findById(id);
 
@@ -237,9 +273,19 @@ export const editExpense = TryCatch(
     const newType = type !== undefined ? type : oldType;
     const newDate = date !== undefined ? new Date(date) : expense.date;
 
+    // Cast so TypeScript does not narrow them to their initial values across
+    // the transaction callback that assigns them.
+    let savedCategory = null as CategoryDTO | null;
+    let categoriesVersion = undefined as number | undefined;
+
     const session = await mongoose.startSession();
     try {
       await session.withTransaction(async () => {
+        // `withTransaction` re-runs this callback on a write conflict; start
+        // each run clean so an aborted attempt's category never leaks out.
+        savedCategory = null;
+        categoriesVersion = undefined;
+
         // Which ledger should own the row after the edit?
         const targetLedger =
           date !== undefined
@@ -277,12 +323,36 @@ export const editExpense = TryCatch(
           { session },
         );
 
+        /**
+         * Same as addExpense (spec 6.3), keyed on the type AFTER the edit: a
+         * debit "Food" switched to credit creates a credit "Food". The phone
+         * flags an edit only when the category text or the type changed, so
+         * an amount-only edit never brings back a removed chip and never
+         * rewrites an old spelling.
+         */
+        if (
+          newCategory &&
+          category !== undefined &&
+          isStorableCategory(category)
+        ) {
+          const result = await addCategoryIfNew(
+            userId,
+            newType,
+            category,
+            session,
+          );
+          savedCategory = result.category;
+          categoriesVersion = result.version;
+        }
+
         expense.amount = newAmount;
         expense.type = newType;
         expense.date = newDate;
         expense.ledgerId = targetLedger._id;
         if (remarks !== undefined) expense.remarks = remarks;
-        if (category !== undefined) expense.category = category;
+        if (category !== undefined) {
+          expense.category = savedCategory ? savedCategory.name : category;
+        }
 
         await expense.save({ session });
       });
@@ -294,6 +364,8 @@ export const editExpense = TryCatch(
       success: true,
       message: "Expense updated successfully",
       expense,
+      ...(savedCategory ? { category: savedCategory } : {}),
+      ...(categoriesVersion !== undefined ? { categoriesVersion } : {}),
     });
   },
 );

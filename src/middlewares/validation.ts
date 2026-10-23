@@ -359,6 +359,9 @@ export const addExpenseSchema = z.object({
     remarks: shortText(200, "Remarks").optional(),
     category: shortText(50, "Category").optional(),
     type: z.enum(["debit", "credit"]).default("debit"),
+    // Sent by the app when the category is not in its saved list, asking the
+    // server to add it (services/expenseCategories.ts). Absent = save as before.
+    newCategory: z.boolean().optional(),
   }),
 });
 
@@ -370,6 +373,7 @@ export const editExpenseSchema = z.object({
     remarks: shortText(200, "Remarks").optional(),
     category: shortText(50, "Category").optional(),
     type: z.enum(["debit", "credit"]).optional(),
+    newCategory: z.boolean().optional(),
   }),
 });
 
@@ -417,6 +421,8 @@ export const expenseStatsSchema = z.object({
 export const exportLedgerSchema = z.object({
   query: z.object({ ledgerId: objectId }),
 });
+
+export const expenseCategoryIdParamSchema = z.object({ params: z.object({ id: objectId }) });
 
 // ========================
 // Stats Validation Schemas

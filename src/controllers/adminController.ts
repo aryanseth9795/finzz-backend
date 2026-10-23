@@ -6,6 +6,7 @@ import TryCatch from "../utils/TryCatch.js";
 import { User } from "../models/userModel.js";
 import { Expense } from "../models/expenseModel.js";
 import { ExpenseLedger } from "../models/expenseLedgerModel.js";
+import { ExpenseCategory } from "../models/expenseCategoryModel.js";
 import { Pool } from "../models/poolModel.js";
 import { Tx } from "../models/txModel.js";
 import { Chat } from "../models/chatModel.js";
@@ -445,6 +446,7 @@ export const deleteUser = TryCatch(
           // Own data
           Expense.deleteMany({ userId }, { session }),
           ExpenseLedger.deleteMany({ userId }, { session }),
+          ExpenseCategory.deleteMany({ userId }, { session }),
 
           // Anything referencing the user from either direction
           Notification.deleteMany(
