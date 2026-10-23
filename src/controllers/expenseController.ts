@@ -12,7 +12,13 @@ import {
   monthRangeUtc,
   daysInMonth,
 } from "../utils/dates.js";
-import { expenseCategoryOf } from "../services/expenseReport/category.js";
+import {
+  categoryKey,
+  expenseCategoryKeyOf,
+  expenseCategoryOf,
+  groupByCategory,
+  oldestFirst,
+} from "../services/expenseReport/category.js";
 import {
   addCategoryIfNew,
   isStorableCategory,
@@ -726,7 +732,16 @@ export const getAdvancedStats = TryCatch(
     const threeMonthExpenses = await Expense.find({
       userId: userObjectId,
       date: { $gte: trendStart, $lt: endOfMonth },
-    }).lean();
+    }).lean<
+      Array<{
+        _id: mongoose.Types.ObjectId;
+        amount: number;
+        type: "debit" | "credit";
+        date: Date;
+        remarks?: string;
+        category?: string;
+      }>
+    >();
 
     const allMonthExpenses = threeMonthExpenses.filter(
       (exp) => exp.date >= startOfMonth && exp.date < endOfMonth,
@@ -736,55 +751,58 @@ export const getAdvancedStats = TryCatch(
       (exp) => exp.type === "credit",
     );
 
-    const categoryMap: Record<string, { total: number; count: number }> = {};
-    let debitMonthTotal = 0;
+    const debitMonthTotal = debitExpenses.reduce(
+      (sum, exp) => sum + exp.amount,
+      0,
+    );
 
-    for (const exp of debitExpenses) {
-      debitMonthTotal += exp.amount;
-      const label = expenseCategoryOf(exp);
-      if (!categoryMap[label]) categoryMap[label] = { total: 0, count: 0 };
-      categoryMap[label].total += exp.amount;
-      categoryMap[label].count += 1;
-    }
+    // "Food", "food " and "FOOD" are one row, named by the most-used spelling
+    // (groupByCategory). Grouped oldest first so a tied spelling resolves the
+    // same way here and in the PDF.
+    const categoryGroups = groupByCategory([...debitExpenses].sort(oldestFirst));
+    const categoryBreakdown = categoryGroups.map(({ name, total, count }) => ({
+      name,
+      total: Math.round(total * 100) / 100,
+      count,
+      percentage:
+        debitMonthTotal > 0
+          ? Math.round((total / debitMonthTotal) * 100 * 10) / 10
+          : 0,
+    }));
 
-    const categoryBreakdown = Object.entries(categoryMap)
-      .map(([name, { total, count }]) => ({
-        name,
-        total: Math.round(total * 100) / 100,
-        count,
-        percentage:
-          debitMonthTotal > 0
-            ? Math.round((total / debitMonthTotal) * 100 * 10) / 10
-            : 0,
-      }))
-      .sort((a, b) => b.total - a.total);
-
-    // ── 3b. Category trend: top 7 categories x last 3 months (zero-filled) ──
-    // 7 matches the screen's category list.
+    // ── 3b. Category trend: every category x last 3 months (zero-filled) ──
+    // One row per categoryBreakdown row, in the same order: the screen lists
+    // every category with its sparkline. Months merge variants by the same key.
     const monthKeys = trendMonths.map(
       (m) => `${m.year}-${String(m.month).padStart(2, "0")}`,
     );
-    const trendTotals: Record<string, Record<string, number>> = {};
+    const trendTotals = new Map<string, Map<string, number>>();
     for (const exp of threeMonthExpenses) {
       if (exp.type !== "debit") continue;
       const p = periodOf(exp.date, tz);
       const key = `${p.year}-${String(p.month).padStart(2, "0")}`;
       if (!monthKeys.includes(key)) continue;
-      const label = expenseCategoryOf(exp);
-      const byMonth = (trendTotals[label] ??= {});
-      byMonth[key] = (byMonth[key] ?? 0) + exp.amount;
+      const catKey = expenseCategoryKeyOf(exp);
+      let byMonth = trendTotals.get(catKey);
+      if (!byMonth) {
+        byMonth = new Map();
+        trendTotals.set(catKey, byMonth);
+      }
+      byMonth.set(key, (byMonth.get(key) ?? 0) + exp.amount);
     }
-    const categoryTrend = categoryBreakdown.slice(0, 7).map((c) => ({
-      name: c.name,
+    const categoryTrend = categoryGroups.map((g) => ({
+      name: g.name,
       months: monthKeys.map((key) => ({
         month: key,
-        total: round2(trendTotals[c.name]?.[key] ?? 0),
+        total: round2(trendTotals.get(g.key)?.get(key) ?? 0),
       })),
     }));
 
     // ── 4. Top 5 Expenses for selected month ──
     // `category` is already resolved with the shared rule (#tag > category >
-    // "Other") so clients needn't re-derive it.
+    // "Other") and named like its categoryBreakdown row, so clients needn't
+    // re-derive it.
+    const categoryNameByKey = new Map(categoryGroups.map((g) => [g.key, g.name]));
     const top5 = [...debitExpenses]
       .sort((a, b) => b.amount - a.amount)
       .slice(0, 5)
@@ -793,7 +811,8 @@ export const getAdvancedStats = TryCatch(
         amount: e.amount,
         date: e.date,
         remarks: e.remarks || "",
-        category: expenseCategoryOf(e),
+        category:
+          categoryNameByKey.get(expenseCategoryKeyOf(e)) ?? expenseCategoryOf(e),
         type: e.type,
       }));
 
@@ -1028,30 +1047,31 @@ function buildExpenseExportHtml({
   const net = round2(received - spent);
   const activeDays = new Set(debits.map((t) => t.day)).size;
 
-  const catMap = new Map<string, { total: number; count: number }>();
-  for (const t of debits) {
-    const c = catMap.get(t.category) ?? { total: 0, count: 0 };
-    c.total += t.amount;
-    c.count += 1;
-    catMap.set(t.category, c);
-  }
+  // Merged exactly as getAdvancedStats merges them ("Food" = "food "), grouped
+  // oldest first so a tied spelling gets the same name as on the screen.
+  const groups = groupByCategory(
+    expenses
+      .filter((e) => e.type !== "credit")
+      .sort(oldestFirst)
+      .map((e) => ({ amount: Number(e.amount) || 0, category: expenseCategoryOf(e) })),
+    (t) => t.category,
+  );
   const pctOf = (v: number) =>
     spent > 0 ? Math.round((v / spent) * 1000) / 10 : 0;
-  const categories = [...catMap.entries()]
-    .map(([name, { total, count }]) => ({
-      name,
-      total: round2(total),
-      count,
-      pct: pctOf(total),
-    }))
-    .sort((a, b) => b.total - a.total);
+  const categories = groups.map(({ name, total, count }) => ({
+    name,
+    total: round2(total),
+    count,
+    pct: pctOf(total),
+  }));
+  const categoryNameByKey = new Map(groups.map((g) => [g.key, g.name]));
 
   const top = [...debits]
     .sort((a, b) => b.amount - a.amount)
     .slice(0, 5)
     .map((t) => ({
       label: t.remarks || t.category,
-      category: t.category,
+      category: categoryNameByKey.get(categoryKey(t.category)) ?? t.category,
       day: t.day,
       amount: t.amount,
       pct: pctOf(t.amount),
