@@ -11,6 +11,10 @@ import {
   closeLedger,
   exportPDF,
 } from "../controllers/expenseController.js";
+import {
+  listExpenseCategories,
+  deleteExpenseCategory,
+} from "../controllers/expenseCategoryController.js";
 import isAuthenticated from "../middlewares/auth.js";
 import { heavyLimiter } from "../middlewares/rateLimit.js";
 import {
@@ -23,6 +27,7 @@ import {
   checkDuplicateSchema,
   expenseStatsSchema,
   exportLedgerSchema,
+  expenseCategoryIdParamSchema,
 } from "../middlewares/validation.js";
 
 const router = express.Router();
@@ -34,7 +39,7 @@ const router = express.Router();
  * bypassed its "past months only" guard.
  *
  * Note the ordering below: the literal paths (`/check-duplicate`, `/stats`,
- * `/ledgers`, `/export`) are declared BEFORE `/:id`. Express matches in
+ * `/ledgers`, `/export`, `/categories`) are declared BEFORE `/:id`. Express matches in
  * declaration order, so with `/:id` first a GET of `/check-duplicate` would
  * bind `id = "check-duplicate"`.
  */
@@ -72,6 +77,17 @@ router.get(
   heavyLimiter,
   validate(exportLedgerSchema),
   exportPDF,
+);
+
+// Saved categories (the chips on Add/Edit Expense). The list has no validate
+// middleware: it takes only the optional `tzOffsetMinutes`, which the
+// controller bounds with parseTzOffset.
+router.get("/categories", isAuthenticated, listExpenseCategories);
+router.delete(
+  "/categories/:id",
+  isAuthenticated,
+  validate(expenseCategoryIdParamSchema),
+  deleteExpenseCategory,
 );
 
 // Expense CRUD

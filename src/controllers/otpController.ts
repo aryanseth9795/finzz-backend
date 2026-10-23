@@ -216,12 +216,17 @@ export const registerWithEmail = TryCatch(
       return next(new Errorhandler("This email is already registered", 400));
     }
 
+    // A new account has no expenses, so its category list is already "filled"
+    // and empty. Set here rather than as a schema default: a default would also
+    // apply to old accounts on read, and their one-time first fill would never
+    // run (services/expenseCategories.ts).
     const user = await User.create({
       name: name.trim(),
       phone,
       password,
       email: normalizedEmail,
       emailVerified: true,
+      expenseCategoriesVersion: 0,
     });
 
     // The verification has been spent.
