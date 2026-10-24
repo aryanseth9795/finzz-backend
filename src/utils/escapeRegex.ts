@@ -12,9 +12,14 @@
  *     backtracking (ReDoS). MongoDB evaluates regexes server-side, so an
  *     unescaped search box lets any caller pin a database thread with a
  *     handful of characters.
+ *
+ * A NUL is not a metacharacter, but MongoDB rejects any pattern that contains
+ * one ("Regular expression cannot contain an embedded null byte", code 2), so
+ * a search with a NUL in it was a 500. It is spelled `\x00` instead, which
+ * PCRE and JavaScript both read as a literal NUL.
  */
 export const escapeRegex = (input: string): string =>
-  input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\0/g, "\\x00");
 
 /** Longest search term accepted. Bounds the work a single query can request. */
 export const MAX_SEARCH_LENGTH = 64;

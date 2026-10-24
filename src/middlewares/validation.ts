@@ -381,12 +381,60 @@ export const expenseIdParamSchema = z.object({
   params: z.object({ id: objectId }),
 });
 
+// The expense list's search and filters arrive as URL strings, so the flags
+// and amounts are parsed here, not with `z.boolean()` / `money`.
+
+/** A query flag: "true"/"false" from a URL, or a real boolean. */
+const queryFlag = z.union(
+  [z.boolean(), z.enum(["true", "false"]).transform((v) => v === "true")],
+  "Must be true or false",
+);
+
+/**
+ * An amount bound: a number ≥ 0 (0 is a valid bound, unlike `money`). A blank
+ * value means "no bound": `z.coerce` would read "" as 0, and a blank max
+ * would then match only zero-amount rows.
+ */
+const amountBound = z.preprocess(
+  (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+  z.coerce.number("Amount must be a number").min(0, "Amount must be 0 or more").optional(),
+);
+
+/**
+ * GET /expenses: the month list, or a search when any filter is set (see
+ * services/expenseSearch.ts for what each filter matches).
+ */
 export const getExpensesSchema = z.object({
-  query: z.object({
-    ledgerId: objectId.optional(),
-    cursor: z.string().max(120).optional(),
-    limit: z.coerce.number().int().min(1).max(100).default(20),
-  }),
+  query: z
+    .object({
+      ledgerId: objectId.optional(),
+      cursor: z.string().max(120).optional(),
+      limit: z.coerce.number().int().min(1).max(100).default(20),
+      q: shortText(50, "Search").optional(),
+      type: z.enum(["debit", "credit"]).optional(),
+      // Repeated keys (category=Food&category=Gym) arrive as an array, but a
+      // single one arrives as a plain string, so both become string[]. Each
+      // name may be as long as a report category, which can come from a #tag
+      // in the 200-character remarks, so the cap is 200, not the field's 50.
+      category: z.preprocess(
+        (v) => (typeof v === "string" ? [v] : v),
+        z
+          .array(shortText(200, "Category"))
+          .max(10, "Choose at most 10 categories")
+          .optional(),
+      ),
+      uncategorized: queryFlag.optional(),
+      minAmount: amountBound,
+      maxAmount: amountBound,
+      includeSummary: queryFlag.optional(),
+    })
+    .refine(
+      (q) =>
+        q.minAmount === undefined ||
+        q.maxAmount === undefined ||
+        q.maxAmount >= q.minAmount,
+      { message: "maxAmount must be at least minAmount", path: ["maxAmount"] },
+    ),
 });
 
 /**

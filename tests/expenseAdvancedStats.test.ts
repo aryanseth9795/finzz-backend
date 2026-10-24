@@ -117,12 +117,13 @@ describe("getAdvancedStats: categoryTrend", () => {
     ]);
   });
 
-  it("wraps across the year boundary and caps at 7 categories", async () => {
+  it("wraps across the year boundary and covers every category", async () => {
     for (let i = 0; i < 9; i++) {
       await insert({ amount: 10 + i, category: `c${i}`, date: "2026-01-05T06:00:00Z" });
     }
     const d = await stats({ year: 2026, month: 1 });
-    expect(d.categoryTrend).toHaveLength(7);
+    // T-014: the screen lists every category, so the trend is no longer capped at 7.
+    expect(d.categoryTrend).toHaveLength(9);
     expect(d.categoryTrend[0].months.map((m: { month: string }) => m.month)).toEqual([
       "2025-11",
       "2025-12",
