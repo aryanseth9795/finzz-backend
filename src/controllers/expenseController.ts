@@ -26,6 +26,8 @@ import {
 } from "../services/expenseCategories.js";
 import { renderExpenseReportHtml } from "../services/expenseReport/template.js";
 import { decodeCursor, cursorFilter, paginate } from "../utils/cursor.js";
+import { buildExpenseFilter, summarizeExpenses } from "../services/expenseSearch.js";
+import { getExpensesSchema } from "../middlewares/validation.js";
 
 // ==========================================
 // Helper: Get or create current month's ledger
@@ -195,26 +197,56 @@ export const getExpenses = TryCatch(
     const userId = req.user.id;
     // Coerced and bounded by getExpensesSchema; `limit` can no longer be NaN
     // (`parseInt("abc")`) or an unbounded number chosen by the caller.
-    const { ledgerId, cursor, limit } = req.query as unknown as {
-      ledgerId?: string;
-      cursor?: string;
-      limit: number;
-    };
+    // Express 5's `req.query` is a getter that re-parses the URL on every read,
+    // so validate()'s coercions and defaults never reach it. Parse it again
+    // here for the typed values (numeric limit, category as an array, the flags
+    // as booleans); validate() has already turned bad input into a 400.
+    const {
+      ledgerId,
+      cursor,
+      limit,
+      q,
+      type,
+      category,
+      uncategorized,
+      minAmount,
+      maxAmount,
+      includeSummary,
+    } = getExpensesSchema.shape.query.parse(req.query);
 
-    const query: Record<string, unknown> = { userId };
-    if (ledgerId) query.ledgerId = ledgerId;
+    // Search and filters (services/expenseSearch.ts). With none set the filter
+    // is `{ userId, ledgerId? }`, so the normal month list is unchanged.
+    const search = {
+      q,
+      type,
+      categories: category,
+      uncategorized,
+      minAmount,
+      maxAmount,
+      ledgerId,
+    };
+    const base = buildExpenseFilter(userId, search);
 
     // Compound keyset cursor. The previous `{ date: { $lt: cursor } }` dropped
-    // every same-day row after the first on each page boundary.
-    Object.assign(query, cursorFilter(decodeCursor(cursor)));
+    // every same-day row after the first on each page boundary. The cursor is
+    // a top-level `$or` (or `date`, for a legacy cursor) and the search keeps
+    // its conditions inside `$and`, so neither overwrites the other.
+    const query = { ...base, ...cursorFilter(decodeCursor(cursor)) };
 
-    const rows = await Expense.find(query)
-      // `_id` must be in the sort for the tie-break in cursorFilter to be
-      // meaningful — a sort key the cursor references but the query does not
-      // order by gives no stable ordering to page through.
-      .sort({ date: -1, _id: -1 })
-      .limit(limit + 1)
-      .lean<{ _id: unknown; date: Date }[]>();
+    const [rows, summary] = await Promise.all([
+      Expense.find(query)
+        // `_id` must be in the sort for the tie-break in cursorFilter to be
+        // meaningful — a sort key the cursor references but the query does not
+        // order by gives no stable ordering to page through.
+        .sort({ date: -1, _id: -1 })
+        .limit(limit + 1)
+        .lean<{ _id: unknown; date: Date }[]>(),
+      // Totals for EVERY match, so the filter without the cursor: the result
+      // header shows them while only the first page is loaded. A freshly built
+      // filter, because Mongoose casts a find() filter in place and `query`
+      // shares `base`'s nested conditions.
+      includeSummary ? summarizeExpenses(buildExpenseFilter(userId, search)) : undefined,
+    ]);
 
     const { items, nextCursor, hasMore } = paginate(rows, limit);
 
@@ -223,6 +255,8 @@ export const getExpenses = TryCatch(
       expenses: items,
       nextCursor,
       hasMore,
+      // Only when asked, so the normal list's response is unchanged.
+      ...(summary ? { summary } : {}),
     });
   },
 );
