@@ -1,7 +1,8 @@
 import mongoose from "mongoose";
 import { Expense } from "../models/expenseModel.js";
 import { escapeRegex } from "../utils/escapeRegex.js";
-import { normalizeCategoryName } from "./expenseCategories.js";
+import { categoryKey, normalizeCategoryName } from "./expenseCategories.js";
+import { OTHER_CATEGORY } from "./expenseReport/category.js";
 
 /**
  * Search and filters for the expense list (`GET /expenses`).
@@ -17,6 +18,13 @@ import { normalizeCategoryName } from "./expenseCategories.js";
  * categories), and the controller merges the keyset cursor, itself a top-level
  * `$or`, into the same object; a top-level `$or` here would be overwritten.
  *
+ * The same casting gap applies to the values. `find()` would read an amount of
+ * "5" as 5, the aggregate would compare it as text and total zero rows. So the
+ * params are read here, not trusted to arrive parsed: the amounts as numbers
+ * (ignored unless finite and ≥ 0), one category as a string or several as an
+ * array, the flag as true or "true". Raw query values give the same rows as
+ * parsed ones, on both sides.
+ *
  * THE SAME ANSWER AS THE REPORT
  * Tapping a category in the report opens this list filtered to it, so a
  * category filter must return exactly the rows the report counts under that
@@ -30,7 +38,9 @@ import { normalizeCategoryName } from "./expenseCategories.js";
  *   - otherwise the trimmed category, unless it is "" or "-";
  *   - otherwise "Other", which is what `uncategorized` selects.
  * Names compare like saved categories do (normalizeCategoryName, ignoring
- * case), so "food  court" finds "Food Court" and "#FOOD court".
+ * case), so "food  court" finds "Food Court" and "#FOOD court". A category
+ * filter for "Other" adds the `uncategorized` rows itself, so it alone is the
+ * report's whole "Other" bucket (blank, "-" and a category typed "Other").
  *
  * WHITESPACE
  * JavaScript's `\s` also matches Unicode spaces (a no-break space, say), while
@@ -48,13 +58,17 @@ import { normalizeCategoryName } from "./expenseCategories.js";
 // escaping itself lives in utils so every search box escapes the same way.
 export { escapeRegex };
 
+/** Parsed values, or the raw query values they come from (see the top). */
 export interface ExpenseSearchParams {
   q?: string;
   type?: "debit" | "credit";
-  categories?: string[];
-  uncategorized?: boolean;
-  minAmount?: number;
-  maxAmount?: number;
+  /** Several names, or one as a lone query value ("Food"). */
+  categories?: string | string[];
+  /** Only true or "true" select the bucket. */
+  uncategorized?: boolean | string;
+  /** Numbers or numeric text; anything not finite and ≥ 0 is no bound. */
+  minAmount?: number | string;
+  maxAmount?: number | string;
   ledgerId?: string;
 }
 
@@ -115,12 +129,17 @@ const categoryBranches = (name: string): Filter[] => {
   return branches;
 };
 
-/** No tag, and a category that is missing, not text, blank or "-". */
+/**
+ * No tag, and a category that is missing, not text, blank or "-". The dash
+ * brings its trailing whitespace with it: `WS*-?WS*` reads the same, but on a
+ * long run of spaces that is not blank it tries every split of the run between
+ * the two `WS*`, which is quadratic in JavaScript's engine.
+ */
 const uncategorizedBranch = (): Filter => ({
   remarks: notTag(),
   $or: [
     { category: { $not: { $type: "string" } } },
-    { category: { $regex: `^${WS}*-?${WS}*$` } },
+    { category: { $regex: `^${WS}*(?:-${WS}*)?$` } },
   ],
 });
 
@@ -129,9 +148,34 @@ const uncategorizedBranch = (): Filter => ({
 /** The search text, trimmed; "" means no search. */
 const searchText = (q: string | undefined) => (typeof q === "string" ? q.trim() : "");
 
-/** The category names, normalised, without blanks (they name nothing). */
-const categoryNames = (categories: string[] | undefined) =>
-  (categories ?? []).map(normalizeCategoryName).filter((name) => name !== "");
+/**
+ * The category names, normalised, without blanks (they name nothing). One
+ * name may come as a plain string; anything that is not text is dropped.
+ */
+const categoryNames = (categories: string | string[] | undefined): string[] =>
+  [categories ?? []]
+    .flat()
+    .filter((name): name is string => typeof name === "string")
+    .map(normalizeCategoryName)
+    .filter((name) => name !== "");
+
+/** True for the flag as parsed (true) or as a raw query value ("true"). */
+const wantsUncategorized = (flag: boolean | string | undefined) =>
+  flag === true || flag === "true";
+
+/**
+ * An amount bound as a number, or undefined for no bound. Blank text is no
+ * bound rather than 0 (Number("") is 0), and so is anything that is not a
+ * finite amount of 0 or more.
+ */
+const amountBound = (raw: number | string | undefined): number | undefined => {
+  if (typeof raw !== "number" && typeof raw !== "string") return undefined;
+  if (typeof raw === "string" && raw.trim() === "") return undefined;
+  const amount = Number(raw);
+  return Number.isFinite(amount) && amount >= 0 ? amount : undefined;
+};
+
+const OTHER_KEY = categoryKey(OTHER_CATEGORY);
 
 /**
  * True when the request is a search rather than the normal list. A ledgerId
@@ -142,9 +186,9 @@ export function isFilteredSearch(p: ExpenseSearchParams): boolean {
     searchText(p.q) !== "" ||
     p.type !== undefined ||
     categoryNames(p.categories).length > 0 ||
-    p.uncategorized === true ||
-    p.minAmount !== undefined ||
-    p.maxAmount !== undefined
+    wantsUncategorized(p.uncategorized) ||
+    amountBound(p.minAmount) !== undefined ||
+    amountBound(p.maxAmount) !== undefined
   );
 }
 
@@ -153,7 +197,8 @@ export function isFilteredSearch(p: ExpenseSearchParams): boolean {
 /**
  * The MongoDB filter for one user's expenses matching `p`, usable as-is in
  * `find()` and in an aggregate's `$match`. Inputs are expected to have passed
- * the route's zod schema (ledgerId is a valid ObjectId, lengths are capped).
+ * the route's zod schema (ledgerId is a valid ObjectId, lengths are capped),
+ * but raw query values give the same filter (see the top).
  */
 export function buildExpenseFilter(userId: string, p: ExpenseSearchParams): Filter {
   const filter: Filter = { userId: new mongoose.Types.ObjectId(userId) };
@@ -174,14 +219,23 @@ export function buildExpenseFilter(userId: string, p: ExpenseSearchParams): Filt
 
   // Categories and uncategorized are one choice of "which buckets", so they
   // are OR-ed together, and AND-ed with everything else.
-  const buckets = categoryNames(p.categories).flatMap(categoryBranches);
-  if (p.uncategorized === true) buckets.push(uncategorizedBranch());
+  const names = categoryNames(p.categories);
+  const buckets = names.flatMap(categoryBranches);
+  // The report's "Other" is the fallback bucket plus a category typed
+  // "Other", so asking for "Other" asks for both, whatever the client sends.
+  const wantsOther = names.some((name) => categoryKey(name) === OTHER_KEY);
+  if (wantsUncategorized(p.uncategorized) || wantsOther) {
+    buckets.push(uncategorizedBranch());
+  }
   if (buckets.length > 0) and.push({ $or: buckets });
 
-  if (p.minAmount !== undefined || p.maxAmount !== undefined) {
+  // Numbers here, never text: the aggregate's $match is not cast.
+  const minAmount = amountBound(p.minAmount);
+  const maxAmount = amountBound(p.maxAmount);
+  if (minAmount !== undefined || maxAmount !== undefined) {
     const amount: Filter = {};
-    if (p.minAmount !== undefined) amount.$gte = p.minAmount;
-    if (p.maxAmount !== undefined) amount.$lte = p.maxAmount;
+    if (minAmount !== undefined) amount.$gte = minAmount;
+    if (maxAmount !== undefined) amount.$lte = maxAmount;
     and.push({ amount });
   }
 

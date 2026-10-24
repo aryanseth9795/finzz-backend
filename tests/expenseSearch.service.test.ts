@@ -14,6 +14,7 @@ import {
   summarizeExpenses,
   type ExpenseSearchParams,
 } from "../src/services/expenseSearch.js";
+import { buildSearchRegex } from "../src/utils/escapeRegex.js";
 
 beforeAll(async () => {
   await connect();
@@ -80,21 +81,58 @@ const sortedNames = (docs: { _id: unknown }[]) =>
   docs.map((d) => names.get(String(d._id)) ?? "?").sort();
 
 /**
+ * `p` spelled the way an unparsed query string would carry it: bounds as text,
+ * a lone category as a string rather than a one-item array, the flag as "true".
+ */
+const asRawQuery = (p: ExpenseSearchParams): ExpenseSearchParams => {
+  const raw: ExpenseSearchParams = { ...p };
+  if (typeof p.minAmount === "number") raw.minAmount = String(p.minAmount);
+  if (typeof p.maxAmount === "number") raw.maxAmount = String(p.maxAmount);
+  if (Array.isArray(p.categories) && p.categories.length === 1) {
+    raw.categories = p.categories[0];
+  }
+  if (p.uncategorized === true) raw.uncategorized = "true";
+  return raw;
+};
+
+/**
  * Names of the rows the filter matches. The controller feeds the same filter
  * to `find()` (the page) and to an aggregate (the totals), and Mongoose casts
  * only the first, so every case checks that both agree. Each gets its own
  * filter object because Mongoose casts a `find()` filter in place.
+ *
+ * Every case is also run with its raw query spelling (`asRawQuery`): the
+ * filter must not lean on `find()`'s casting, which the aggregate never gets,
+ * so "5" has to give the same rows as 5 in both.
  */
 const matched = async (p: ExpenseSearchParams, userId: Id = me) => {
-  const found = await Expense.find(buildExpenseFilter(String(userId), p))
-    .select("_id")
-    .lean<{ _id: unknown }[]>();
-  const aggregated = await Expense.aggregate<{ _id: unknown }>([
-    { $match: buildExpenseFilter(String(userId), p) },
-    { $project: { _id: 1 } },
-  ]);
-  expect(sortedNames(aggregated)).toEqual(sortedNames(found));
-  return sortedNames(found);
+  const rowsOf = async (params: ExpenseSearchParams) => {
+    const found = await Expense.find(buildExpenseFilter(String(userId), params))
+      .select("_id")
+      .lean<{ _id: unknown }[]>();
+    const aggregated = await Expense.aggregate<{ _id: unknown }>([
+      { $match: buildExpenseFilter(String(userId), params) },
+      { $project: { _id: 1 } },
+    ]);
+    expect(sortedNames(aggregated)).toEqual(sortedNames(found));
+    return sortedNames(found);
+  };
+  const rows = await rowsOf(p);
+  expect(await rowsOf(asRawQuery(p))).toEqual(rows);
+  return rows;
+};
+
+/** Every `$regex` in a filter, compiled the way JavaScript would run it. */
+const regexesIn = (node: unknown): RegExp[] => {
+  if (Array.isArray(node)) return node.flatMap(regexesIn);
+  if (node === null || typeof node !== "object") return [];
+  if (node instanceof mongoose.Types.ObjectId) return [];
+  const obj = node as Record<string, unknown>;
+  const own =
+    typeof obj.$regex === "string"
+      ? [new RegExp(obj.$regex, typeof obj.$options === "string" ? obj.$options : "")]
+      : [];
+  return [...own, ...Object.values(obj).flatMap(regexesIn)];
 };
 
 /** The report's label, from the row exactly as stored. */
@@ -114,6 +152,15 @@ describe("escapeRegex", () => {
 
   it("leaves ordinary text unchanged", () => {
     expect(escapeRegex("Food court #1 - cab/auto")).toBe("Food court #1 - cab/auto");
+  });
+
+  it("spells a NUL as \\x00, which MongoDB accepts in a pattern and matches literally", () => {
+    // A raw NUL makes MongoDB reject the whole pattern (code 2).
+    expect(escapeRegex("a\0b")).toBe("a\\x00b");
+    expect(escapeRegex("\\\0")).toBe("\\\\\\x00");
+    const re = new RegExp(`^${escapeRegex("a\0b\\\0")}$`);
+    expect(re.test("a\0b\\\0")).toBe(true);
+    expect(re.test("a b\\ ")).toBe(false);
   });
 });
 
@@ -140,6 +187,23 @@ describe("isFilteredSearch", () => {
       isFilteredSearch({ q: "   ", categories: [], uncategorized: false }),
     ).toBe(false);
     expect(isFilteredSearch({ categories: ["  "] })).toBe(false);
+  });
+
+  it("reads raw query values the way buildExpenseFilter does", () => {
+    expect(isFilteredSearch({ minAmount: "0" })).toBe(true);
+    expect(isFilteredSearch({ maxAmount: "5" })).toBe(true);
+    expect(isFilteredSearch({ categories: "Food" })).toBe(true);
+    expect(isFilteredSearch({ uncategorized: "true" })).toBe(true);
+    // Values buildExpenseFilter ignores are not a search either.
+    expect(
+      isFilteredSearch({
+        minAmount: "abc",
+        maxAmount: "-1",
+        categories: "  ",
+        uncategorized: "false",
+      }),
+    ).toBe(false);
+    expect(isFilteredSearch({ minAmount: "", maxAmount: Number.NaN })).toBe(false);
   });
 });
 
@@ -204,6 +268,21 @@ describe("q", () => {
     expect(await matched({ q: ".*" })).toEqual(["literal"]);
     expect(await matched({ q: ".*(" })).toEqual(["literal"]);
     expect(await matched({ q: "(used)" })).toEqual(["parens"]);
+  });
+
+  it("searches a NUL literally instead of failing the query", async () => {
+    await seed([
+      { name: "nul remarks", remarks: "odd\0text" },
+      { name: "nul category", category: "Fo\0od" },
+      { name: "plain", remarks: "odd text", category: "Food" },
+    ]);
+    expect(await matched({ q: "odd\0" })).toEqual(["nul remarks"]);
+    expect(await matched({ q: "\0" })).toEqual(["nul category", "nul remarks"]);
+    expect(await matched({ categories: ["fo\0od"] })).toEqual(["nul category"]);
+    // The other search boxes (notes, admin) escape through the same helper.
+    const contains = buildSearchRegex("odd\0")!;
+    const rows = await Expense.find({ userId: me, remarks: contains }).lean();
+    expect(sortedNames(rows)).toEqual(["nul remarks"]);
   });
 });
 
@@ -362,6 +441,82 @@ describe("uncategorized", () => {
       "food",
     ]);
   });
+
+  it("is included by a category filter for \"Other\", so that alone is the report's whole Other bucket", async () => {
+    const rows: Row[] = [
+      { name: "missing" },
+      { name: "blank", category: "  " },
+      { name: "dash", category: "-" },
+      { name: "empty hash", remarks: "# ", category: " - " },
+      { name: "typed Other", category: "Other" },
+      { name: "typed other", category: " other " },
+      { name: "Other tag", remarks: "#OTHER", category: "Food" },
+      { name: "food", category: "Food" },
+      { name: "dash tag", remarks: "#-" },
+    ];
+    await seed(rows);
+    const bucket = rows
+      .filter((r) => categoryKey(labelOf(r)) === categoryKey(OTHER_CATEGORY))
+      .map((r) => r.name)
+      .sort();
+    expect(bucket).toHaveLength(7);
+    expect(await matched({ categories: ["Other"] })).toEqual(bucket);
+    expect(await matched({ categories: ["  OTHER "] })).toEqual(bucket);
+    // With the flag too, or beside another category, nothing changes.
+    expect(await matched({ categories: ["other"], uncategorized: true })).toEqual(bucket);
+    expect(await matched({ categories: ["Food", "Other"] })).toEqual(
+      [...bucket, "food"].sort(),
+    );
+  });
+
+  it("classifies a category of 20k spaces quickly and correctly", async () => {
+    const spaces = " ".repeat(20_000);
+    const rows: Row[] = [
+      { name: "long blank", category: spaces },
+      { name: "long dash", category: `${spaces}-${spaces}` },
+      // Each of these used to cost the old pattern quadratic backtracking.
+      { name: "long then word", category: `${spaces}Food` },
+      { name: "long then two dashes", category: `${spaces}--` },
+    ];
+    expect(rows.map(labelOf)).toEqual(["Other", "Other", "Food", "--"]);
+    await seed(rows);
+
+    const started = performance.now();
+    const summary = await summarizeExpenses(
+      buildExpenseFilter(String(me), { uncategorized: true }),
+    );
+    const elapsed = performance.now() - started;
+    expect(summary.count).toBe(2);
+    expect(elapsed).toBeLessThan(50);
+
+    expect(await matched({ uncategorized: true })).toEqual(["long blank", "long dash"]);
+    expect(await matched({ categories: ["food"] })).toEqual(["long then word"]);
+  });
+
+  it("uses no pattern that backtracks on long whitespace, in JavaScript's engine too", () => {
+    // MongoDB 7's PCRE2 happened to survive the old `WS*-?WS*`; V8 took about
+    // 600 ms on these inputs. So every pattern the filter sends is timed here.
+    const filter = buildExpenseFilter(String(me), {
+      q: "x",
+      categories: ["Other", "food court"],
+      uncategorized: true,
+    });
+    const patterns = regexesIn(filter);
+    expect(patterns.length).toBeGreaterThan(5);
+
+    const spaces = " ".repeat(20_000);
+    const texts = [
+      spaces,
+      `${spaces}x`,
+      `${spaces}-${spaces}x`,
+      `${spaces}--`,
+      `food${spaces}court${spaces}x`,
+      `#${spaces}food${spaces}court${spaces}x`,
+    ];
+    const started = performance.now();
+    for (const re of patterns) for (const text of texts) re.test(text);
+    expect(performance.now() - started).toBeLessThan(50);
+  });
 });
 
 //======= amount =======//
@@ -385,6 +540,51 @@ describe("amount range", () => {
 
   it("combines with the other filters (all must hold)", async () => {
     expect(await matched({ maxAmount: 15, categories: ["Food"] })).toEqual(["15"]);
+  });
+
+  it("ignores a bound that is not a finite amount of 0 or more", async () => {
+    const all = ["10", "15", "20", "5"];
+    for (const bad of ["abc", "-1", "", "  ", "Infinity", -1, Number.NaN, Infinity]) {
+      expect(await matched({ minAmount: bad })).toEqual(all);
+      expect(await matched({ maxAmount: bad })).toEqual(all);
+    }
+    // The good bound still applies beside a bad one.
+    expect(await matched({ minAmount: "abc", maxAmount: "10" })).toEqual(["10", "5"]);
+  });
+});
+
+//======= raw query values =======//
+
+describe("raw query values", () => {
+  it("totals a text bound the way find() reads it (\"5\" is 5, not zero rows)", async () => {
+    await seed([
+      { name: "4", amount: 4 },
+      { name: "5", amount: 5 },
+      { name: "7", amount: 7, type: "credit" },
+    ]);
+    expect(
+      await summarizeExpenses(buildExpenseFilter(String(me), { minAmount: "5" })),
+    ).toEqual({ count: 2, debitTotal: 5, creditTotal: 7 });
+    expect(
+      await summarizeExpenses(buildExpenseFilter(String(me), { maxAmount: "4.5" })),
+    ).toEqual({ count: 1, debitTotal: 4, creditTotal: 0 });
+  });
+
+  it("takes one category as a string, and the flag as \"true\" only", async () => {
+    await seed([
+      { name: "food", category: "Food" },
+      { name: "blank", category: "" },
+      { name: "rent", category: "Rent" },
+    ]);
+    expect(await matched({ categories: "food" })).toEqual(["food"]);
+    expect(await matched({ categories: "Food", uncategorized: "true" })).toEqual([
+      "blank",
+      "food",
+    ]);
+    const all = ["blank", "food", "rent"];
+    for (const flag of ["false", "1", "", "TRUE"]) {
+      expect(await matched({ uncategorized: flag })).toEqual(all);
+    }
   });
 });
 
@@ -504,13 +704,10 @@ describe("parity with expenseCategoryOf", () => {
         .filter((r) => categoryKey(labelOf(r)) === key)
         .map((r) => r.name)
         .sort();
-      // The report's "Other" is the fallback bucket (`uncategorized`) plus any
-      // category the user literally named "Other".
-      const params: ExpenseSearchParams =
-        key === categoryKey(OTHER_CATEGORY)
-          ? { categories: [label], uncategorized: true }
-          : { categories: [label] };
-      expect({ label, rows: await matched(params) }).toEqual({ label, rows: expected });
+      // The label alone, "Other" included: the filter adds the fallback
+      // bucket for it, so the client need not send `uncategorized` as well.
+      const rows = await matched({ categories: [label] });
+      expect({ label, rows }).toEqual({ label, rows: expected });
     }
   });
 });
