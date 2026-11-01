@@ -1,5 +1,13 @@
 import mongoose, { Document, Schema } from "mongoose";
 
+/** How an expense was paid. Optional: absent means "not recorded". */
+export const PAYMENT_MODES = ["cash", "online"] as const;
+export type PaymentMode = (typeof PAYMENT_MODES)[number];
+
+/** How an online payment was made (Card covers debit and credit cards). */
+export const PAYMENT_METHODS = ["upi", "card", "netbanking", "wallet", "other"] as const;
+export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
+
 export interface IExpense extends Document {
   userId: mongoose.Types.ObjectId;
   ledgerId: mongoose.Types.ObjectId;
@@ -8,6 +16,8 @@ export interface IExpense extends Document {
   date: Date;
   remarks?: string;
   category?: string;
+  paymentMode?: PaymentMode;
+  paymentMethod?: PaymentMethod;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -49,6 +59,19 @@ const expenseSchema = new Schema<IExpense>(
     category: {
       type: String,
       trim: true,
+    },
+    // Both optional with no default: rows without them (every row saved
+    // before this field, and any the user leaves blank) mean "not recorded".
+    // `paymentMethod` is only meaningful when `paymentMode` is "online";
+    // validation and editExpense keep it off every other row. No index:
+    // nothing filters on them yet.
+    paymentMode: {
+      type: String,
+      enum: PAYMENT_MODES,
+    },
+    paymentMethod: {
+      type: String,
+      enum: PAYMENT_METHODS,
     },
   },
   {

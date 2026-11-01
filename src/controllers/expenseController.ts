@@ -75,7 +75,19 @@ export const addExpense = TryCatch(
     // (addExpenseSchema). It used to be the raw body value with no schema on
     // the route at all, which is how `ledger.totalExpenses += amount` came to
     // evaluate `50 + "100"` as the string "50100".
-    const { amount, date, remarks, category, type, newCategory } = req.body;
+    // `paymentMode`/`paymentMethod` are optional and already consistent
+    // (addExpenseSchema refuses a method without online mode). An undefined
+    // one is simply not stored, which is how an older app's rows look.
+    const {
+      amount,
+      date,
+      remarks,
+      category,
+      type,
+      newCategory,
+      paymentMode,
+      paymentMethod,
+    } = req.body;
     const userId = req.user.id;
     const tzOffset = parseTzOffset(req.body.tzOffsetMinutes);
 
@@ -146,6 +158,8 @@ export const addExpense = TryCatch(
               date: expenseDate,
               remarks,
               category: savedCategory ? savedCategory.name : category,
+              paymentMode,
+              paymentMethod,
             },
           ],
           { session },
@@ -268,7 +282,16 @@ export const editExpense = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { id } = req.params;
     const userId = req.user.id;
-    const { amount, date, remarks, category, type, newCategory } = req.body;
+    const {
+      amount,
+      date,
+      remarks,
+      category,
+      type,
+      newCategory,
+      paymentMode,
+      paymentMethod,
+    } = req.body;
 
     const expense = await Expense.findById(id);
 
@@ -290,6 +313,18 @@ export const editExpense = TryCatch(
       return next(
         new ErrorHandler("Cannot edit expenses in a closed ledger", 400),
       );
+    }
+
+    /**
+     * The payment mode AFTER this edit: a missing key keeps the stored mode,
+     * `null` clears it. editExpenseSchema can only refuse a method sent with
+     * an explicit non-online mode; a method sent alone has to be judged
+     * against the stored mode, so a Cash row cannot be given "upi" here.
+     */
+    const finalMode =
+      paymentMode === undefined ? expense.paymentMode : (paymentMode ?? undefined);
+    if (paymentMethod != null && finalMode !== "online") {
+      return next(new ErrorHandler("Payment method needs online mode", 400));
     }
 
     const oldAmount = expense.amount;
@@ -392,6 +427,16 @@ export const editExpense = TryCatch(
         if (remarks !== undefined) expense.remarks = remarks;
         if (category !== undefined) {
           expense.category = savedCategory ? savedCategory.name : category;
+        }
+        // Assigning `undefined` makes Mongoose `$unset` the field, so a
+        // cleared value is really gone from the stored row.
+        if (paymentMode !== undefined) expense.paymentMode = paymentMode ?? undefined;
+        if (finalMode !== "online") {
+          // A method only describes an online payment: switching to Cash (or
+          // clearing the mode) drops it, so no Cash row keeps a leftover "upi".
+          expense.paymentMethod = undefined;
+        } else if (paymentMethod !== undefined) {
+          expense.paymentMethod = paymentMethod ?? undefined;
         }
 
         await expense.save({ session });
