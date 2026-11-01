@@ -437,6 +437,10 @@ export const editExpense = TryCatch(
           expense.paymentMethod = undefined;
         } else if (paymentMethod !== undefined) {
           expense.paymentMethod = paymentMethod ?? undefined;
+          // `expense` was read before the transaction (see T-013), so write
+          // the mode with the method: a concurrent switch to Cash can then
+          // never leave a stored "cash + card" pair; the last edit wins both.
+          expense.markModified("paymentMode");
         }
 
         await expense.save({ session });
