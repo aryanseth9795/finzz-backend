@@ -7,6 +7,7 @@ import {
   NOTE_SHARES_MAX,
   NOTE_TITLE_MAX,
 } from "../models/noteModel.js";
+import { PAYMENT_METHODS, PAYMENT_MODES } from "../models/expenseModel.js";
 
 //======= Shared primitives =======//
 //
@@ -352,29 +353,54 @@ export const friendIdParamSchema = z.object({
 // Expense Validation Schemas
 // ========================
 
+const PAYMENT_METHOD_NEEDS_ONLINE = "Payment method needs online mode";
+
 export const addExpenseSchema = z.object({
-  body: z.object({
-    amount: money,
-    date: isoDate,
-    remarks: shortText(200, "Remarks").optional(),
-    category: shortText(50, "Category").optional(),
-    type: z.enum(["debit", "credit"]).default("debit"),
-    // Sent by the app when the category is not in its saved list, asking the
-    // server to add it (services/expenseCategories.ts). Absent = save as before.
-    newCategory: z.boolean().optional(),
-  }),
+  body: z
+    .object({
+      amount: money,
+      date: isoDate,
+      remarks: shortText(200, "Remarks").optional(),
+      category: shortText(50, "Category").optional(),
+      type: z.enum(["debit", "credit"]).default("debit"),
+      // Sent by the app when the category is not in its saved list, asking the
+      // server to add it (services/expenseCategories.ts). Absent = save as before.
+      newCategory: z.boolean().optional(),
+      // Optional: an app that predates them sends neither, and the row then
+      // means "not recorded".
+      paymentMode: z.enum(PAYMENT_MODES).optional(),
+      paymentMethod: z.enum(PAYMENT_METHODS).optional(),
+    })
+    // A method says how an ONLINE payment was made, so "cash + upi" (or a
+    // method with no mode) is a contradiction, not something to store.
+    .refine((b) => b.paymentMethod === undefined || b.paymentMode === "online", {
+      message: PAYMENT_METHOD_NEEDS_ONLINE,
+      path: ["paymentMethod"],
+    }),
 });
 
 export const editExpenseSchema = z.object({
   params: z.object({ id: objectId }),
-  body: z.object({
-    amount: money.optional(),
-    date: isoDate.optional(),
-    remarks: shortText(200, "Remarks").optional(),
-    category: shortText(50, "Category").optional(),
-    type: z.enum(["debit", "credit"]).optional(),
-    newCategory: z.boolean().optional(),
-  }),
+  body: z
+    .object({
+      amount: money.optional(),
+      date: isoDate.optional(),
+      remarks: shortText(200, "Remarks").optional(),
+      category: shortText(50, "Category").optional(),
+      type: z.enum(["debit", "credit"]).optional(),
+      newCategory: z.boolean().optional(),
+      // Missing = leave unchanged; `null` = clear.
+      paymentMode: z.enum(PAYMENT_MODES).nullable().optional(),
+      paymentMethod: z.enum(PAYMENT_METHODS).nullable().optional(),
+    })
+    // Only the contradiction visible in the body is refused here. A method
+    // sent alone depends on the STORED mode, which editExpense checks.
+    .refine(
+      (b) =>
+        b.paymentMethod == null ||
+        (b.paymentMode !== "cash" && b.paymentMode !== null),
+      { message: PAYMENT_METHOD_NEEDS_ONLINE, path: ["paymentMethod"] },
+    ),
 });
 
 export const expenseIdParamSchema = z.object({
