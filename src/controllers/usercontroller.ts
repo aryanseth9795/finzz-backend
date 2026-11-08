@@ -1,6 +1,8 @@
 import TryCatch from "../utils/TryCatch.js";
 import { phoneVariants } from "../utils/phone.js";
+import mongoose from "mongoose";
 import { User } from "../models/userModel.js";
+import { deleteUserCascade } from "../services/accountDeletion.js";
 import { Request, Response, NextFunction } from "express";
 import Errorhandler from "../middlewares/Errorhandler.js";
 import sendToken, {
@@ -353,5 +355,30 @@ export const uploadAvatar = TryCatch(
       avatar: uploadResult.secure_url,
       user,
     });
+  },
+);
+
+// Self-service account deletion. Requires the current password so a stolen
+// access token alone cannot erase the account.
+export const deleteMyAccount = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const { password } = req.body;
+
+    const user = await User.findById(req.user.id).select("+password");
+    if (!user) {
+      return next(new Errorhandler("User not found", 404));
+    }
+
+    // 400, not 401: the App's axios interceptor treats any 401 from a
+    // non-credential route as an expired access token and refreshes and
+    // retries. 401 must only mean a missing or expired token (isAuthenticated).
+    if (!(await user.comparePassword(password))) {
+      return next(new Errorhandler("Incorrect password", 400));
+    }
+
+    await deleteUserCascade(user._id as mongoose.Types.ObjectId);
+
+    res.clearCookie("token");
+    res.status(200).json({ success: true, message: "Account deleted" });
   },
 );
