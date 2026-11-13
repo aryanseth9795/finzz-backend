@@ -9,6 +9,7 @@ import {
   updatePushStatus,
   removePushToken,
   uploadAvatar,
+  deleteMyAccount,
 } from "../controllers/usercontroller.js";
 import {
   sendOtp,
@@ -40,6 +41,7 @@ import {
   forgotPasswordSchema,
   changePasswordSchema,
   verifyEmailSchema,
+  deleteAccountSchema,
 } from "../middlewares/validation.js";
 import { upload } from "../middlewares/upload.js";
 
@@ -113,6 +115,13 @@ router.post(
   "/remove-push-token",
   isAuthenticated,
   removePushToken,
+);
+router.post(
+  "/delete-account",
+  isAuthenticated,
+  authLimiter,
+  validate(deleteAccountSchema),
+  deleteMyAccount,
 );
 router.post(
   "/upload-avatar",

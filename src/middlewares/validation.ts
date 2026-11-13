@@ -734,3 +734,9 @@ export const shareNoteSchema = z.object({
 export const noteShareUserParamSchema = z.object({
   params: z.object({ noteId: objectId, userId: objectId }),
 });
+
+export const deleteAccountSchema = z.object({
+  body: z.object({
+    password: z.string().min(1, "Password is required").max(128),
+  }),
+});
