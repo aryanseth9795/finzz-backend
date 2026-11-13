@@ -11,6 +11,7 @@ import {
   escapeRegex,
   isFilteredSearch,
   buildExpenseFilter,
+  parseAmountQuery,
   summarizeExpenses,
   type ExpenseSearchParams,
 } from "../src/services/expenseSearch.js";
@@ -283,6 +284,57 @@ describe("q", () => {
     const contains = buildSearchRegex("odd\0")!;
     const rows = await Expense.find({ userId: me, remarks: contains }).lean();
     expect(sortedNames(rows)).toEqual(["nul remarks"]);
+  });
+});
+
+describe("parseAmountQuery", () => {
+  it.each([
+    ["540", 540],
+    [" ₹1,320 ", 1320],
+    ["-540", 540],
+    ["+540", 540],
+    ["Rs 540", 540],
+    ["rs.540", 540],
+    ["INR 540", 540],
+    ["540.50", 540.5],
+    ["540.5", 540.5],
+    ["0", 0],
+    ["5 4 0", 540],
+  ])("reads %j as %d", (input, expected) => {
+    expect(parseAmountQuery(input)).toBe(expected);
+  });
+
+  it.each(["540abc", "1.234", "", "₹", ".", "1e3", "Infinity"])("reads %j as null", (input) => {
+    expect(parseAmountQuery(input)).toBeNull();
+  });
+});
+
+describe("q as an amount", () => {
+  const qBranches = (q: string) => {
+    const and = buildExpenseFilter(String(me), { q }).$and as { $or: Record<string, unknown>[] }[];
+    expect(and).toHaveLength(1);
+    return and[0].$or;
+  };
+
+  it("adds an exact amount branch beside remarks and category for a number", () => {
+    const or = qBranches("540");
+    expect(or).toContainEqual({ amount: 540 });
+    expect(or.filter((b) => "remarks" in b)).toHaveLength(1);
+    expect(or.filter((b) => "category" in b)).toHaveLength(1);
+    expect(or).toHaveLength(3);
+  });
+
+  it("adds no amount branch for text", () => {
+    expect(qBranches("biryani").some((b) => "amount" in b)).toBe(false);
+  });
+
+  it("matches the amount exactly, in find and in the aggregate", async () => {
+    await seed([
+      { name: "exact", amount: 540 },
+      { name: "bigger", amount: 5400 },
+      { name: "remark", amount: 120, remarks: "table 540 booking" },
+    ]);
+    expect(await matched({ q: "540" })).toEqual(["exact", "remark"]);
   });
 });
 
