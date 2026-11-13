@@ -25,6 +25,12 @@ import { OTHER_CATEGORY } from "./expenseReport/category.js";
  * array, the flag as true or "true". Raw query values give the same rows as
  * parsed ones, on both sides.
  *
+ * AMOUNT IN THE SEARCH BOX
+ * When `q` reads as an amount (parseAmountQuery: an optional sign, "₹", "Rs"
+ * or "INR", commas and spaces ignored, at most two decimals), an exact
+ * `{ amount }` branch joins the remarks and category branches of the `q` $or.
+ * Exact, never partial: "54" does not find 540.
+ *
  * THE SAME ANSWER AS THE REPORT
  * Tapping a category in the report opens this list filtered to it, so a
  * category filter must return exactly the rows the report counts under that
@@ -145,6 +151,21 @@ const uncategorizedBranch = (): Filter => ({
 
 //======= Params =======//
 
+/**
+ * `q` as an amount, or null when it is not one. Drops a leading sign and
+ * currency word or symbol, then commas and spaces, and needs digits with at
+ * most two decimals ("5 4 0" is 540).
+ */
+export function parseAmountQuery(q: string): number | null {
+  const cleaned = q
+    .trim()
+    .replace(/^[+-]?\s*(?:₹|rs\.?|inr)?/i, "")
+    .replace(/[,\s]/g, "");
+  if (!/^\d+(\.\d{1,2})?$/.test(cleaned)) return null;
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
 /** The search text, trimmed; "" means no search. */
 const searchText = (q: string | undefined) => (typeof q === "string" ? q.trim() : "");
 
@@ -212,7 +233,10 @@ export function buildExpenseFilter(userId: string, p: ExpenseSearchParams): Filt
     // Escaped, so ".*(" is searched for literally and cannot cost a slow
     // or broken pattern.
     const contains = { $regex: escapeRegex(q), $options: "i" };
-    and.push({ $or: [{ remarks: contains }, { category: { ...contains } }] });
+    const or: Filter[] = [{ remarks: contains }, { category: { ...contains } }];
+    const amount = parseAmountQuery(q);
+    if (amount !== null) or.push({ amount });
+    and.push({ $or: or });
   }
 
   if (p.type) and.push({ type: p.type });

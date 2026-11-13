@@ -173,6 +173,46 @@ describe("search text (q)", () => {
   });
 });
 
+describe("search text that is an amount", () => {
+  const seedAmounts = () =>
+    seed(alice, [
+      { label: "biryani", amount: 540, remarks: "Biryani" },
+      { label: "rent", amount: 5400, remarks: "Rent part" },
+      { label: "booking", amount: 120, remarks: "table 540 booking" },
+      { label: "groceries", amount: 1320, remarks: "Groceries" },
+    ]);
+
+  it("matches the amount exactly, and remarks containing the number", async () => {
+    await seedAmounts();
+    expect(labelsOf(await list(alice, { q: "540" }).expect(200))).toEqual(["biryani", "booking"]);
+  });
+
+  it("reads a currency sign and thousands commas", async () => {
+    await seedAmounts();
+    expect(labelsOf(await list(alice, { q: "₹1,320" }).expect(200))).toEqual(["groceries"]);
+  });
+
+  it("totals the summary over the returned rows", async () => {
+    await seedAmounts();
+    const res = await list(alice, { q: "540", includeSummary: true }).expect(200);
+    expect(res.body.summary).toEqual({ count: 2, debitTotal: 660, creditTotal: 0 });
+  });
+
+  it("does not match a partial amount", async () => {
+    await seedAmounts();
+    expect(labelsOf(await list(alice, { q: "54" }).expect(200))).toEqual(["booking"]);
+  });
+
+  it("matches a stored decimal amount however the decimals are typed", async () => {
+    await seed(alice, [
+      { label: "chai", amount: 540.5, remarks: "Chai" },
+      { label: "round", amount: 540, remarks: "Biryani" },
+    ]);
+    expect(labelsOf(await list(alice, { q: "540.50" }).expect(200))).toEqual(["chai"]);
+    expect(labelsOf(await list(alice, { q: "540.5" }).expect(200))).toEqual(["chai"]);
+  });
+});
+
 describe("type", () => {
   it("returns money out or money in only", async () => {
     await seed(alice, [
