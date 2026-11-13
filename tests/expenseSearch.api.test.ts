@@ -202,6 +202,15 @@ describe("search text that is an amount", () => {
     await seedAmounts();
     expect(labelsOf(await list(alice, { q: "54" }).expect(200))).toEqual(["booking"]);
   });
+
+  it("matches a stored decimal amount however the decimals are typed", async () => {
+    await seed(alice, [
+      { label: "chai", amount: 540.5, remarks: "Chai" },
+      { label: "round", amount: 540, remarks: "Biryani" },
+    ]);
+    expect(labelsOf(await list(alice, { q: "540.50" }).expect(200))).toEqual(["chai"]);
+    expect(labelsOf(await list(alice, { q: "540.5" }).expect(200))).toEqual(["chai"]);
+  });
 });
 
 describe("type", () => {

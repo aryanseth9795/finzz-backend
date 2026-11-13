@@ -304,7 +304,7 @@ describe("parseAmountQuery", () => {
     expect(parseAmountQuery(input)).toBe(expected);
   });
 
-  it.each(["540abc", "1.234", "", "₹", ".", "1e3", "Infinity"])("reads %j as null", (input) => {
+  it.each(["540abc", "1.234", "", "₹", ".", "1e3", "Infinity", "--540", "₹ -540", "540.", ".5", "५४०"])("reads %j as null", (input) => {
     expect(parseAmountQuery(input)).toBeNull();
   });
 });
