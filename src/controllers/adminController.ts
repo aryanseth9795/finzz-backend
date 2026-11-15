@@ -161,6 +161,21 @@ export const adminVerify = TryCatch(
   },
 );
 
+// Credits are money received. Rows saved before `type` existed have no
+// field and are debits, so debits are matched as "not credit".
+const DEBIT_MATCH = { type: { $ne: "credit" } };
+const isCredit = { $eq: ["$type", "credit"] };
+const debitAmount = { $cond: [isCredit, 0, "$amount"] };
+const creditAmount = { $cond: [isCredit, "$amount", 0] };
+// Missing, null and "" all group as "Uncategorised".
+const categoryName = {
+  $cond: [
+    { $in: [{ $ifNull: ["$category", ""] }, [""]] },
+    "Uncategorised",
+    "$category",
+  ],
+};
+
 // ==========================================
 // Dashboard Stats
 // ==========================================
@@ -175,6 +190,7 @@ export const getDashboardStats = TryCatch(
       monthlyExpenseData,
       categoryData,
       dailySignups,
+      grandTotals,
     ] = await Promise.all([
       // Counts
       User.countDocuments(),
@@ -189,10 +205,11 @@ export const getDashboardStats = TryCatch(
         .select("name phone avatar _id")
         .lean(),
 
-      // Monthly expense totals (last 12 months)
+      // Monthly spending (debits, last 12 months)
       Expense.aggregate([
         {
           $match: {
+            ...DEBIT_MATCH,
             date: {
               $gte: new Date(new Date().setMonth(new Date().getMonth() - 12)),
             },
@@ -211,9 +228,9 @@ export const getDashboardStats = TryCatch(
         { $sort: { "_id.year": 1, "_id.month": 1 } },
       ]),
 
-      // Top expense categories
+      // Top spending categories (debits)
       Expense.aggregate([
-        { $match: { category: { $nin: [null, ""] } } },
+        { $match: { ...DEBIT_MATCH, category: { $nin: [null, ""] } } },
         {
           $group: {
             _id: "$category",
@@ -254,6 +271,17 @@ export const getDashboardStats = TryCatch(
         },
         { $sort: { _id: 1 } },
       ]),
+
+      // All-time debit and credit totals
+      Expense.aggregate([
+        {
+          $group: {
+            _id: null,
+            debit: { $sum: debitAmount },
+            credit: { $sum: creditAmount },
+          },
+        },
+      ]),
     ]);
 
     // Format monthly expense data
@@ -263,11 +291,6 @@ export const getDashboardStats = TryCatch(
       count: m.count,
     }));
 
-    // Grand total expense
-    const grandTotalExpense = await Expense.aggregate([
-      { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]);
-
     res.status(200).json({
       success: true,
       stats: {
@@ -275,8 +298,8 @@ export const getDashboardStats = TryCatch(
         totalExpenses,
         totalPools,
         totalTransactions,
-        grandTotalExpense:
-          grandTotalExpense.length > 0 ? grandTotalExpense[0].total : 0,
+        grandTotalExpense: grandTotals[0]?.debit ?? 0,
+        grandTotalCredit: grandTotals[0]?.credit ?? 0,
         recentUsers,
         monthlyExpenses: formattedMonthlyExpenses,
         categoryData: categoryData.map((c: any) => ({
@@ -356,10 +379,12 @@ export const getUserDetail = TryCatch(
       {
         $group: {
           _id: null,
-          totalAmount: { $sum: "$amount" },
+          totalAmount: { $sum: debitAmount },
+          totalCredits: { $sum: creditAmount },
           count: { $sum: 1 },
         },
       },
+      { $project: { _id: 0 } },
     ]);
 
     // Get user's pools
@@ -387,7 +412,7 @@ export const getUserDetail = TryCatch(
       expenseSummary:
         expenseSummary.length > 0
           ? expenseSummary[0]
-          : { totalAmount: 0, count: 0 },
+          : { totalAmount: 0, totalCredits: 0, count: 0 },
       pools,
       ledgers,
     });
@@ -430,11 +455,16 @@ export const getAllExpenses = TryCatch(
     const endDate = req.query.endDate as string;
     const userId = req.query.userId as string;
 
+    // Raw YYYY-MM-DD strings (validated). Range is UTC [start, end + 1 day).
     const filter: any = {};
     if (startDate || endDate) {
       filter.date = {};
-      if (startDate) filter.date.$gte = new Date(startDate);
-      if (endDate) filter.date.$lte = new Date(endDate);
+      if (startDate) filter.date.$gte = new Date(`${startDate}T00:00:00Z`);
+      if (endDate) {
+        const end = new Date(`${endDate}T00:00:00Z`);
+        end.setUTCDate(end.getUTCDate() + 1);
+        filter.date.$lt = end;
+      }
     }
     if (userId) {
       filter.userId = new mongoose.Types.ObjectId(userId);
@@ -468,15 +498,19 @@ export const getAllExpenses = TryCatch(
               {
                 $group: {
                   _id: null,
-                  totalAmount: { $sum: "$amount" },
+                  totalAmount: { $sum: debitAmount },
+                  totalCredits: { $sum: creditAmount },
                   count: { $sum: 1 },
+                  creditCount: { $sum: { $cond: [isCredit, 1, 0] } },
                 },
               },
             ],
+            // Spending by category: credits are income, so excluded.
             byCategory: [
+              { $match: DEBIT_MATCH },
               {
                 $group: {
-                  _id: { $ifNull: ["$category", "Uncategorised"] },
+                  _id: categoryName,
                   total: { $sum: "$amount" },
                   count: { $sum: 1 },
                 },
@@ -490,7 +524,12 @@ export const getAllExpenses = TryCatch(
     ]);
 
     const facet = aggregate[0] ?? { overall: [], byCategory: [] };
-    const overall = facet.overall?.[0] ?? { totalAmount: 0, count: 0 };
+    const overall = facet.overall?.[0] ?? {
+      totalAmount: 0,
+      totalCredits: 0,
+      count: 0,
+      creditCount: 0,
+    };
 
     res.status(200).json({
       success: true,
@@ -502,8 +541,12 @@ export const getAllExpenses = TryCatch(
         pages: Math.ceil(total / limit),
       },
       totals: {
+        // Debits only; name kept for older admin builds.
         totalAmount: overall.totalAmount,
+        totalCredits: overall.totalCredits,
         count: overall.count,
+        debitCount: overall.count - overall.creditCount,
+        creditCount: overall.creditCount,
         byCategory: (facet.byCategory ?? []).map(
           (c: { _id: string; total: number; count: number }) => ({
             name: c._id,

@@ -576,14 +576,29 @@ export const adminIdParamSchema = z.object({
   params: z.object({ id: objectId }),
 });
 
+/** A real calendar date, `YYYY-MM-DD` (rejects 2026-02-30). */
+const calendarDate = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be YYYY-MM-DD")
+  .refine((s) => {
+    const d = new Date(`${s}T00:00:00Z`);
+    return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+  }, "Date does not exist");
+
 export const adminExpenseQuerySchema = z.object({
-  query: z.object({
-    page: z.coerce.number().int().min(1).default(1),
-    limit: z.coerce.number().int().min(1).max(200).default(20),
-    startDate: z.string().optional(),
-    endDate: z.string().optional(),
-    userId: objectId.optional(),
-  }),
+  query: z
+    .object({
+      page: z.coerce.number().int().min(1).default(1),
+      limit: z.coerce.number().int().min(1).max(200).default(20),
+      startDate: calendarDate.optional(),
+      endDate: calendarDate.optional(),
+      userId: objectId.optional(),
+    })
+    // Same-format strings compare correctly as text.
+    .refine(
+      (q) => !q.startDate || !q.endDate || q.startDate <= q.endDate,
+      { message: "End date must be on or after start date", path: ["endDate"] },
+    ),
 });
 
 export const adminPoolQuerySchema = z.object({
