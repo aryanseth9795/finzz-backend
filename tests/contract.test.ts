@@ -436,7 +436,12 @@ describe("Contract: admin user detail (server ↔ admin)", () => {
 
     // The page reads `expenseSummary.totalAmount` directly; an array here
     // would render "₹0" silently, or throw if the shape changed again.
-    expect(res.body.expenseSummary).toEqual({ totalAmount: 0, count: 0 });
+    // totalAmount is debits only; credits are reported apart (T-023).
+    expect(res.body.expenseSummary).toEqual({
+      totalAmount: 0,
+      totalCredits: 0,
+      count: 0,
+    });
     expect(Array.isArray(res.body.expenseSummary)).toBe(false);
     expect(Array.isArray(res.body.ledgers)).toBe(true);
   });
